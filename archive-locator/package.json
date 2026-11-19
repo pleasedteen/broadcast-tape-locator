@@ -1,0 +1,16 @@
+{
+  "name": "archive-locator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "广播档案馆节目定位服务：本地模拟站点 + 同步采集器 + 查询接口（TypeScript / Node.js / SQLite，零外部依赖）",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "site": "node --disable-warning=ExperimentalWarning src/site.ts",
+    "sync": "node --disable-warning=ExperimentalWarning src/sync.ts",
+    "api": "node --disable-warning=ExperimentalWarning src/api.ts",
+    "verify": "node --disable-warning=ExperimentalWarning src/verify.ts"
+  }
+}
