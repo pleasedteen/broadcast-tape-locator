@@ -22,16 +22,25 @@ interface PageTokenRec {
   key: string;
   page: number;
   consumed: boolean;
+  contentHash: string; // 签发令牌时清单的内容指纹；清单被同号更正后旧令牌取页会被拒
 }
 interface Session {
   id: string;
   epoch: number;
   tokens: Map<string, PageTokenRec>;
 }
+interface TimelineDef {
+  durationMs: number;
+  edition: number; // 同一版次号下时长每次变更 +1；时长不变则 edition 不变
+}
 interface Manifest extends ManifestSeed {
   listed: boolean;
   withdrawAfterPage: number | null;
   losePages: Map<number, number>; // page -> 剩余丢响应次数
+  contentHash: string; // 清单内容指纹（含 pageSize 与全部记录），同号更正时变化
+  timelineEdition: number; // 发布时所依据的时间轴定义 edition
+  replaceAfterPage: number | null; // 演示用：发出该页后自动以 replacement 同号更正
+  replacement: ManifestSeed | null;
 }
 interface LogEntry {
   t: number;
@@ -43,7 +52,7 @@ interface Source {
   pausedUntil: number;
   epoch: number; // 每次暂停 +1，使旧会话失效
   sessions: Map<string, Session>;
-  timelines: Map<number, number>; // 时间轴版次 -> 时长 ms
+  timelines: Map<number, TimelineDef>; // 时间轴版次号 -> 当前定义（时长 + edition）
   manifests: Map<string, Manifest>;
   log: LogEntry[];
 }
@@ -54,7 +63,15 @@ const state = {
 };
 
 const keyOf = (kind: string, v: number, r: number) => `${kind}:${v}:${r}`;
-const pageCountOf = (m: Manifest) => Math.max(1, Math.ceil(m.records.length / m.pageSize));
+const pageCountOf = (m: ManifestSeed) => Math.max(1, Math.ceil(m.records.length / m.pageSize));
+
+/**
+ * 清单内容指纹：记录内容或 pageSize 任意变化都会改变（含「总页数未变」的同号更正）。
+ * 原样重发得到相同指纹——采集器据此复用已采页、只续采缺页。
+ */
+function contentHashOf(seed: ManifestSeed): string {
+  return sha256(`${seed.pageSize}|${JSON.stringify(seed.records)}`);
+}
 
 function slog(src: Source | null, route: string, detail: string): void {
   if (src) {
@@ -70,7 +87,7 @@ function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
     pausedUntil: 0,
     epoch: 1,
     sessions: new Map(),
-    timelines: new Map(timelines),
+    timelines: new Map(timelines.map(([version, durationMs]) => [version, { durationMs, edition: 1 }])),
     manifests: new Map(),
     log: [],
   };
@@ -78,15 +95,25 @@ function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
   return src;
 }
 
-function addManifest(tapeId: string, seed: ManifestSeed): void {
+/** 发布（或同号更正）一份清单；同号更正时旧清单被新内容指纹的清单替换 */
+function addManifest(tapeId: string, seed: ManifestSeed): Manifest {
   const src = state.sources.get(tapeId);
   if (!src) throw new Error(`未知母带 ${tapeId}`);
-  src.manifests.set(keyOf(seed.kind, seed.timelineVersion, seed.revision), {
+  const tl = src.timelines.get(seed.timelineVersion);
+  if (!tl) throw new Error(`未知时间轴版次 v${seed.timelineVersion}`);
+  const existed = src.manifests.get(keyOf(seed.kind, seed.timelineVersion, seed.revision));
+  const mf: Manifest = {
     ...seed,
     listed: true,
-    withdrawAfterPage: null,
+    withdrawAfterPage: existed?.withdrawAfterPage ?? null,
     losePages: new Map(),
-  });
+    replaceAfterPage: null,
+    replacement: null,
+    contentHash: contentHashOf(seed),
+    timelineEdition: tl.edition,
+  };
+  src.manifests.set(keyOf(seed.kind, seed.timelineVersion, seed.revision), mf);
+  return mf;
 }
 
 // ---------- 初始目录数据（演示场景） ----------
@@ -241,15 +268,21 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     slog(src, 'index', '拉取索引');
     send(res, 200, {
       signToken: state.signToken,
-      timelines: [...src.timelines.entries()].map(([version, durationMs]) => ({ version, durationMs })),
+      timelines: [...src.timelines.entries()].map(([version, def]) => ({
+        version,
+        durationMs: def.durationMs,
+        edition: def.edition,
+      })),
       manifests: [...src.manifests.values()]
         .filter((x) => x.listed)
         .map((x) => ({
           kind: x.kind,
           timelineVersion: x.timelineVersion,
+          timelineEdition: x.timelineEdition,
           revision: x.revision,
           pageCount: pageCountOf(x),
           recordCount: x.records.length,
+          contentHash: x.contentHash,
         })),
     });
     return;
@@ -267,10 +300,17 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       send(res, 416, { error: 'NO_SUCH_PAGE' });
       return;
     }
-    const tk: PageTokenRec = { id: randomToken(), key, page: body.page, consumed: false };
+    // 令牌绑定申请时的内容指纹：清单若在翻页途中被同号更正，旧令牌取页会被识别并拒绝
+    const wantHash = typeof body.contentHash === 'string' ? body.contentHash : '';
+    if (wantHash !== mf.contentHash) {
+      slog(src, 'page-token', `${key} 内容指纹已变化（同号更正）→ 410 SUPERSEDED`);
+      send(res, 410, { error: 'SUPERSEDED', contentHash: mf.contentHash });
+      return;
+    }
+    const tk: PageTokenRec = { id: randomToken(), key, page: body.page, consumed: false, contentHash: mf.contentHash };
     sess.tokens.set(tk.id, tk);
     slog(src, 'page-token', `${key} 第${body.page + 1}页 签发翻页令牌 ${tk.id.slice(0, 8)}…`);
-    send(res, 200, { pageToken: tk.id, signToken: state.signToken });
+    send(res, 200, { pageToken: tk.id, signToken: state.signToken, contentHash: mf.contentHash });
     return;
   }
 
@@ -300,6 +340,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       send(res, 410, { error: 'WITHDRAWN' });
       return;
     }
+    if (tk.contentHash !== mf.contentHash) {
+      // 翻页途中清单已被同号更正：拒绝旧指纹的令牌，新清单的页绝不混入旧修订
+      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 清单已同号更正，旧页令牌作废 → 410 SUPERSEDED`);
+      send(res, 410, { error: 'SUPERSEDED', contentHash: mf.contentHash });
+      return;
+    }
     tk.consumed = true; // 令牌先消费——此后即使响应丢失也不补发同一令牌
     const loses = mf.losePages.get(tk.page) ?? 0;
     if (loses > 0) {
@@ -314,7 +360,17 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       mf.listed = false;
       slog(src, 'withdraw', `${tk.key} 发出第${tk.page + 1}页后撤下`);
     }
-    send(res, 200, renderPage(mf, tk.page, layout));
+    const pageBody = renderPage(mf, tk.page, layout);
+    // 演示用：该页发出后立即以同号更正替换清单（模拟「翻页中收到更正」）。
+    // 注意：本页内容取自替换前的 mf，页体回带的必须是本页内容的指纹（即 mf.contentHash）。
+    if (mf.replaceAfterPage === tk.page && mf.replacement) {
+      const seed = mf.replacement;
+      mf.replaceAfterPage = null;
+      mf.replacement = null;
+      const next = addManifest(src.tapeId, seed);
+      slog(src, 'correct', `${tk.key} 发出第${tk.page + 1}页后同号更正（内容指纹 ${mf.contentHash.slice(0, 8)}… → ${next.contentHash.slice(0, 8)}…）`);
+    }
+    send(res, 200, { ...pageBody, contentHash: mf.contentHash, timelineEdition: mf.timelineEdition });
     return;
   }
 
@@ -335,6 +391,7 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
         sessions: [...s.sessions.keys()],
         manifests: [...s.manifests.entries()].map(([key, x]) => ({
           key, listed: x.listed, pageCount: pageCountOf(x), recordCount: x.records.length,
+          contentHash: x.contentHash, timelineEdition: x.timelineEdition,
         })),
         log: s.log,
       };
@@ -379,10 +436,37 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
   if (path === '/control/publish' && req.method === 'POST') {
     const src = state.sources.get(body.tape);
     if (!src) return send(res, 404, { error: 'UNKNOWN_TAPE' });
-    if (body.timeline) src.timelines.set(Number(body.timeline.version), Number(body.timeline.durationMs));
+    if (body.timeline) {
+      const v = Number(body.timeline.version);
+      const dur = Number(body.timeline.durationMs);
+      const cur = src.timelines.get(v);
+      if (!cur) {
+        src.timelines.set(v, { durationMs: dur, edition: 1 });
+      } else if (cur.durationMs !== dur) {
+        // 时长变更：同版次号下定义 edition +1，旧定义在库中仍可被旧清单引用
+        src.timelines.set(v, { durationMs: dur, edition: cur.edition + 1 });
+        slog(src, 'timeline', `时间轴 v${v} 时长变更 → edition ${cur.edition + 1}（${cur.durationMs}ms → ${dur}ms）`);
+      }
+    }
     const mf = body.manifest as ManifestSeed;
-    addManifest(body.tape, mf);
-    slog(src, 'publish', `${mf.kind} v${mf.timelineVersion} rev${mf.revision} 已发布（${mf.records.length} 条记录）`);
+    const key = keyOf(mf.kind, mf.timelineVersion, mf.revision);
+    const old = src.manifests.get(key);
+    const stored = addManifest(body.tape, mf);
+    if (old && old.contentHash !== stored.contentHash) {
+      slog(src, 'correct', `${key} 同号更正（内容指纹 ${old.contentHash.slice(0, 8)}… → ${stored.contentHash.slice(0, 8)}…，页数 ${pageCountOf(old)} → ${pageCountOf(stored)}）`);
+    } else {
+      slog(src, 'publish', `${key} 已发布（${mf.records.length} 条记录，内容指纹 ${stored.contentHash.slice(0, 8)}…）`);
+    }
+    send(res, 200, { ok: true, contentHash: stored.contentHash, timelineEdition: stored.timelineEdition, pageCount: pageCountOf(stored) });
+    return;
+  }
+  if (path === '/control/correct-after' && req.method === 'POST') {
+    // 演示控制：目标清单发出指定页后，立即以 replacement 做同号更正（复现「翻页中收到更正」）
+    const src = state.sources.get(body.tape);
+    const mf = src?.manifests.get(keyOf(body.kind, body.timelineVersion, body.revision));
+    if (!src || !mf) return send(res, 404, { error: 'UNKNOWN_MANIFEST' });
+    mf.replaceAfterPage = Number(body.page);
+    mf.replacement = body.manifest as ManifestSeed;
     send(res, 200, { ok: true });
     return;
   }

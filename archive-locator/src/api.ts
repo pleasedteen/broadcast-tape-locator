@@ -26,7 +26,7 @@ const ROOT = join(fileURLToPath(import.meta.url), '..', '..');
 const DB_PATH = process.env.DB_PATH ?? join(ROOT, 'data', 'archive.db');
 
 mkdirSync(dirname(DB_PATH), { recursive: true });
-const db = openDb(DB_PATH);
+const db = await openDb(DB_PATH);
 
 function send(res: http.ServerResponse, status: number, obj: any): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -36,7 +36,7 @@ function send(res: http.ServerResponse, status: number, obj: any): void {
 function activationInfo(tape: string): any {
   return db
     .prepare(
-      `SELECT a.tape_id, a.timeline_version, a.activated_at,
+      `SELECT a.tape_id, a.timeline_version, a.timeline_edition, a.activated_at,
               pr.revision AS program_rev, pr.id AS program_rev_id,
               rr.revision AS restoration_rev, rr.id AS restoration_rev_id
        FROM activations a
@@ -67,21 +67,24 @@ function copyViews(restorationRevId: number, rangeStart: number, rangeEnd: numbe
   return out;
 }
 
-function tapeDuration(tape: string, version: number): number {
-  const tl = db.prepare('SELECT duration_ms AS d FROM timelines WHERE tape_id = ? AND timeline_version = ?').get(tape, version) as any;
+function tapeDuration(tape: string, version: number, edition: number): number {
+  const tl = db
+    .prepare('SELECT duration_ms AS d FROM timelines WHERE tape_id = ? AND timeline_version = ? AND timeline_edition = ?')
+    .get(tape, version, edition) as any;
   if (tl) return tl.d;
   const mx = db
     .prepare(
-      `SELECT MAX(master_end_ms) AS m FROM segments WHERE revision_id IN (SELECT id FROM revisions WHERE tape_id = ? AND timeline_version = ?)`,
+      `SELECT MAX(master_end_ms) AS m FROM segments
+       WHERE revision_id IN (SELECT id FROM revisions WHERE tape_id = ? AND timeline_version = ? AND timeline_edition = ?)`,
     )
-    .get(tape, version) as any;
+    .get(tape, version, edition) as any;
   return mx?.m ?? 0;
 }
 
 function tapeView(tape: string): { status: number; body: any } {
   const act = activationInfo(tape);
   if (!act) return { status: 404, body: { error: 'NO_ACTIVE_VERSION', message: '两类清单尚无均已采齐的共同时间轴版次' } };
-  const durationMs = tapeDuration(tape, act.timeline_version);
+  const durationMs = tapeDuration(tape, act.timeline_version, act.timeline_edition);
   const programs = db
     .prepare('SELECT program_id, title, start_ms, end_ms FROM programs WHERE revision_id = ? ORDER BY start_ms')
     .all(act.program_rev_id) as any[];
@@ -90,9 +93,12 @@ function tapeView(tape: string): { status: number; body: any } {
     body: {
       tapeId: tape,
       timelineVersion: act.timeline_version,
+      timelineEdition: act.timeline_edition,
       durationMs,
       programRevision: act.program_rev,
+      programRevisionId: act.program_rev_id,
       restorationRevision: act.restoration_rev,
+      restorationRevisionId: act.restoration_rev_id,
       activatedAt: act.activated_at,
       programs: programs.map((p) => ({ id: p.program_id, title: p.title, masterRange: [p.start_ms, p.end_ms] })),
       copies: copyViews(act.restoration_rev_id, 0, durationMs),
@@ -112,8 +118,11 @@ function programView(tape: string, pid: string): { status: number; body: any } {
     body: {
       tapeId: tape,
       timelineVersion: act.timeline_version,
+      timelineEdition: act.timeline_edition,
       programRevision: act.program_rev,
+      programRevisionId: act.program_rev_id,
       restorationRevision: act.restoration_rev,
+      restorationRevisionId: act.restoration_rev_id,
       program: { id: prog.program_id, title: prog.title, masterRange: [prog.start_ms, prog.end_ms] },
       copies: copyViews(act.restoration_rev_id, prog.start_ms, prog.end_ms),
     },
@@ -126,11 +135,15 @@ function syncStatus(): any {
     pausedUntil: s.paused_until,
     sessionId: s.session_id,
   }));
-  const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, kind, revision').all() as any[]).map((r) => ({
+  const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, timeline_edition, kind, revision, id').all() as any[]).map((r) => ({
+    revisionId: r.id,
     tapeId: r.tape_id,
     kind: r.kind,
     timelineVersion: r.timeline_version,
+    timelineEdition: r.timeline_edition,
     revision: r.revision,
+    contentHash: r.content_hash,
+    recordCount: r.record_count,
     status: r.status,
     pagesDone: r.pages_done,
     pageCount: r.page_count,
@@ -145,6 +158,9 @@ function syncStatus(): any {
   const activations = (db.prepare('SELECT * FROM activations ORDER BY tape_id').all() as any[]).map((a) => ({
     tapeId: a.tape_id,
     timelineVersion: a.timeline_version,
+    timelineEdition: a.timeline_edition,
+    programRevisionId: a.program_revision_id,
+    restorationRevisionId: a.restoration_revision_id,
   }));
   return { sources, revisions, activations };
 }
@@ -174,6 +190,7 @@ const server = http.createServer((req, res) => {
         const acts = (db.prepare('SELECT * FROM activations ORDER BY tape_id').all() as any[]).map((a) => ({
           tapeId: a.tape_id,
           timelineVersion: a.timeline_version,
+          timelineEdition: a.timeline_edition,
         }));
         return send(res, 200, { tapes: acts });
       }
@@ -191,6 +208,7 @@ const server = http.createServer((req, res) => {
         return send(res, 200, {
           tapeId: tape,
           timelineVersion: act.timeline_version,
+          timelineEdition: act.timeline_edition,
           programRevision: act.program_rev,
           programs: programs.map((p) => ({ id: p.program_id, title: p.title, masterRange: [p.start_ms, p.end_ms] })),
         });
