@@ -3,12 +3,15 @@
  *   npm run verify
  *
  * 场景覆盖：
- *   阶段 1  首次采集：翻页响应丢失（令牌已消费）后的恢复；T3 清单采不齐不影响他盘
- *   阶段 2  来源暂停：暂停期间该来源零请求，其他来源继续同步
+ *   阶段 1  首次采集：两个采集进程同库并行——来源按租约分片、慢页时取页实际重叠；
+ *           翻页响应丢失（令牌已消费）后的恢复；T3 清单采不齐不影响他盘
+ *   阶段 2  来源暂停：任一进程登记暂停后两进程都停发请求，其他来源继续同步，查询持续可用
  *   阶段 3  恢复后发放新会话；同版次节目单新修订生效，播放位置与缺失区段一起更新
  *   阶段 4  新时间轴版次 v2 生效；被新版清单移除的记录随修订撤下
- *   阶段 5  采集器重启：原有修订已撤下；已采齐修订复用不重采；查询持续可用
- *   阶段 6  节目定位结果展示
+ *   阶段 5  进程卡住接管：SIGSTOP 卡住持有者（进程仍存活），另一进程 3 秒内租约接手、
+ *           从已落库的页之后继续；恢复后晚到的旧响应被丢弃，不覆盖新进度或会话
+ *   阶段 6  采集器重启：原有修订已撤下；已采齐修订复用不重采；查询持续可用
+ *   阶段 7  节目定位结果展示
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync, rmSync } from 'node:fs';
@@ -54,7 +57,17 @@ function startProc(name: string, script: string, env: Record<string, string>): C
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  c.stdout!.on('data', (d) => String(d).split('\n').filter(Boolean).forEach((l) => console.log(`  │ ${name} │ ${l}`)));
+  const lines: string[] = [];
+  (c as any).logLines = lines;
+  c.stdout!.on('data', (d) =>
+    String(d)
+      .split('\n')
+      .filter(Boolean)
+      .forEach((l) => {
+        lines.push(l);
+        console.log(`  │ ${name} │ ${l}`);
+      }),
+  );
   c.stderr!.on('data', (d) => String(d).split('\n').filter(Boolean).forEach((l) => console.log(`  │ ${name}⚠ │ ${l}`)));
   children.push(c);
   return c;
@@ -153,32 +166,58 @@ const T2_PROG_REV2: Rec[] = [
 const T3_REST_REV2: Rec[] = [
   { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 900_000, copyStartMs: 0, rate: 1 },
 ];
+const T2_REST_REV2: Rec[] = [
+  { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 500_000, copyStartMs: 0, rate: 1 },
+  { type: 'damage', copyId: 'C1', masterStartMs: 500_000, masterEndMs: 600_000, note: '划痕，跳音' },
+  { type: 'segment', copyId: 'C1', masterStartMs: 600_000, masterEndMs: 1_800_000, copyStartMs: 500_000, rate: 1 },
+  { type: 'segment', copyId: 'C2', masterStartMs: 0, masterEndMs: 1_800_000, copyStartMs: 0, rate: 1 },
+];
 
 // ---------- 主流程 ----------
 async function main(): Promise<void> {
   rmSync(WORK, { recursive: true, force: true });
   mkdirSync(WORK, { recursive: true });
 
-  banner('阶段 0/6 · 启动本地模拟站点与查询接口');
+  banner('阶段 0/7 · 启动本地模拟站点与查询接口');
   startProc('site', 'site.ts', { PORT: String(SITE_PORT) });
   const siteUp = await waitFor('站点启动', async () => (await ctlGet('/control/state')).status === 200, 10_000);
   check('模拟站点启动', siteUp);
-  // 混沌配置：T1 修复清单 rev1 第 2 页丢一次响应；T3 修复清单 rev1 发出第 1 页后撤下
+  // 混沌配置：T1 修复清单 rev1 第 2 页丢一次响应；T3 修复清单 rev1 发出第 1 页后撤下；
+  // T1 修复清单 rev1 与 T2 节目单 rev1 取页各延迟 900ms（本地慢页，制造跨来源取页重叠窗口）
   await ctl('/control/lose-response', { tape: 'T1', kind: 'restoration', timelineVersion: 1, revision: 1, page: 1, times: 1 });
   await ctl('/control/withdraw-after', { tape: 'T3', kind: 'restoration', timelineVersion: 1, revision: 1, page: 0 });
-  note('已注入故障：T1 修复清单第 2 页丢一次响应；T3 修复清单 rev1 发出第 1 页后撤下');
+  await ctl('/control/slow-page', { tape: 'T1', kind: 'restoration', timelineVersion: 1, revision: 1, delayMs: 900 });
+  await ctl('/control/slow-page', { tape: 'T2', kind: 'program', timelineVersion: 1, revision: 1, delayMs: 900 });
+  note('已注入故障：T1 修复清单第 2 页丢一次响应；T3 修复清单 rev1 发出第 1 页后撤下；T1/T2 各一份清单慢页 900ms');
   startProc('api', 'api.ts', { PORT: String(API_PORT), DB_PATH: DB });
   const apiUp = await waitFor('查询接口启动', async () => (await httpReq('GET', `${API}/health`)).status === 200, 10_000);
   check('查询接口启动', apiUp);
 
-  banner('阶段 1/6 · 首次采集：响应丢失恢复 · 采不齐不阻塞他盘');
-  let syncProc = startProc('sync', 'sync.ts', { SITE_URL: SITE, DB_PATH: DB, POLL_MS: '250' });
-  const firstSync = await waitFor(
-    'T1/T2 首版采齐生效',
-    async () => (await getTape('T1')).status === 200 && (await getTape('T2')).status === 200,
-    20_000,
-  );
+  banner('阶段 1/7 · 双进程并行采集：租约分片 · 慢页取页重叠 · 响应丢失恢复');
+  const syncEnv = (id: string) => ({ SITE_URL: SITE, DB_PATH: DB, POLL_MS: '250', WORKER_ID: id, LEASE_MS: '1500', HTTP_TIMEOUT_MS: '10000' });
+  let syncA = startProc('syncA', 'sync.ts', syncEnv('alpha'));
+  let syncB = startProc('syncB', 'sync.ts', syncEnv('beta'));
+  note('已在同一数据库上启动两个采集进程（alpha / beta，租约 1.5s）');
+  // 首首版采齐前持续采样租约持有情况
+  const ownersSeen = new Set<string>();
+  let sawSplit = false;
+  let workersSeen = 0;
+  let firstSync = false;
+  const d1 = Date.now() + 20_000;
+  while (Date.now() < d1 && !firstSync) {
+    const ss = await getStatus();
+    if (ss.status === 200) {
+      workersSeen = Math.max(workersSeen, ss.body.workers.length);
+      const owners = ss.body.sources.map((s: any) => s.owner).filter(Boolean);
+      for (const o of owners) ownersSeen.add(o);
+      if (new Set(owners).size >= 2) sawSplit = true;
+    }
+    firstSync = (await getTape('T1')).status === 200 && (await getTape('T2')).status === 200;
+    if (!firstSync) await sleep(200);
+  }
   check('T1、T2 首版采齐并生效', firstSync, elapsed());
+  check('两个采集进程同时在线（同一数据库）', workersSeen >= 2, `在线进程 ${workersSeen} 个`);
+  check('同一时刻两进程分别持有不同来源（租约互斥分片）', sawSplit, `持有者：${[...ownersSeen].join(' / ')}`);
 
   const st1 = await ctlGet('/control/state');
   const t1log = st1.body.sources.T1.log as any[];
@@ -187,6 +226,28 @@ async function main(): Promise<void> {
   check('翻页响应丢失（令牌已消费）后凭新令牌续采恢复', lost && retokens >= 2, `第 2 页令牌签发 ${retokens} 次`);
   const layouts = new Set(t1log.filter((l) => l.route === 'page' && l.detail.includes('排版')).map((l) => (l.detail.includes('table') ? 'table' : 'cards')));
   check('两种排版均被解析', layouts.has('table') && layouts.has('cards'), [...layouts].join(' / '));
+
+  // 取页实际重叠：某来源一次取页在飞行中（令牌签发 → 页面发出）时，另一来源也在取页
+  const inflightSpans = (log: any[]): Array<[number, number]> => {
+    const tokAt = new Map<string, number>();
+    const spans: Array<[number, number]> = [];
+    for (const l of log) {
+      const m = String(l.detail).match(/^(\S+ 第\d+页)/);
+      if (!m) continue;
+      if (l.route === 'page-token') tokAt.set(m[1], l.t);
+      if (l.route === 'page' && l.detail.includes('发出')) {
+        const t0 = tokAt.get(m[1]);
+        if (t0 !== undefined) spans.push([t0, l.t]);
+      }
+    }
+    return spans;
+  };
+  const t2logP1 = st1.body.sources.T2.log as any[];
+  const spans1 = inflightSpans(t1log);
+  const spans2 = inflightSpans(t2logP1);
+  const overlapped = spans1.some(([a0, a1]) => spans2.some(([b0, b1]) => (a0 < b0 && b0 < a1) || (b0 < a0 && a0 < b1)));
+  const maxSpan = Math.max(0, ...[...spans1, ...spans2].map(([a, b]) => b - a));
+  check('本地慢页时两个来源的取页实际重叠', overlapped, `在飞窗口最长 ${maxSpan}ms`);
 
   const t3 = await getTape('T3');
   check('T3 修复清单采不齐 → 无生效版次，但不影响 T1/T2', t3.status === 404 && t3.body.error === 'NO_ACTIVE_VERSION');
@@ -217,12 +278,14 @@ async function main(): Promise<void> {
     c2a.missing.length === 0 && c2a.playable.some((p: any) => p.master[0] === 1_800_000 && p.copy[1] === 2_200_000),
   );
 
-  banner('阶段 2/6 · 来源暂停：该来源零请求，其他来源继续同步');
+  banner('阶段 2/7 · 来源暂停：两进程都停发请求 · 查询持续可用');
   const sessBefore = (await getStatus()).body.sources.find((s: any) => s.tapeId === 'T1')?.sessionId;
   const pauseStart = Date.now();
   await ctl('/control/pause', { tape: 'T1', durationMs: 4000 });
   note(`已要求暂停 T1 来源 4 秒（${new Date(pauseStart).toISOString().slice(11, 19)} 起）`);
   await sleep(300);
+  const t1DuringPause = await getTape('T1');
+  check('暂停期间定位查询持续可用（此前结果照常返回）', t1DuringPause.status === 200 && t1DuringPause.body.timelineVersion === 1);
   await ctl('/control/publish', { tape: 'T2', manifest: { kind: 'program', timelineVersion: 1, revision: 2, pageSize: 2, records: T2_PROG_REV2 } });
   note('暂停期间发布 T2 节目单 rev2（新增节目 Q3）');
   const t2Switched = await waitFor(
@@ -254,15 +317,15 @@ async function main(): Promise<void> {
     if (!sawNew) await sleep(100);
   }
   const st2 = await ctlGet('/control/state');
-  // 只统计采集器向来源发的 API 请求（排除 publish/pause 等站点控制记录）
+  // 只统计采集器向来源发的 API 请求（排除 publish/pause 等站点控制记录）；两个进程都算
   const API_ROUTES = new Set(['session', 'index', 'page-token', 'page', 'auth', 'blocked']);
   const t1log2 = (st2.body.sources.T1.log as any[]).filter((l) => API_ROUTES.has(l.route));
   const blocked = t1log2.find((l) => l.route === 'blocked' && l.t >= pauseStart - 100);
-  check('采集器收到 423 后登记暂停并停发请求', !!blocked);
+  check('采集进程收到 423 后登记暂停（落库共享）', !!blocked);
   const afterLearn = t1log2.filter((l) => blocked && l.t > blocked.t + 50 && l.t < pauseStart + 3900);
-  check('得知暂停后未再向 T1 发任何请求', afterLearn.length === 0, `登记暂停后窗口内请求 ${afterLearn.length} 个`);
+  check('登记暂停后两个进程都未再向 T1 发任何请求', afterLearn.length === 0, `登记暂停后窗口内请求 ${afterLearn.length} 个`);
 
-  banner('阶段 3/6 · 恢复后新会话 · 同版次修订原子切换');
+  banner('阶段 3/7 · 恢复后新会话 · 同版次修订原子切换');
   check('恢复后 T1 节目单 rev2 采齐生效', sawNew, elapsed());
   check('修订切换原子性：查询结果要么全旧要么全新', sawOld && !sawMixed, `旧 ${sawOld ? '见过' : '未见过'} / 混合 ${sawMixed ? '出现过!' : '未出现'}`);
   const sessAfter = (await getStatus()).body.sources.find((s: any) => s.tapeId === 'T1')?.sessionId;
@@ -279,7 +342,7 @@ async function main(): Promise<void> {
       c1b.playable.some((p: any) => p.master[0] === 1_500_000 && p.master[1] === 2_400_000),
   );
 
-  banner('阶段 4/6 · 新时间轴版次 v2 生效 · 旧记录随修订撤下');
+  banner('阶段 4/7 · 新时间轴版次 v2 生效 · 旧记录随修订撤下');
   await ctl('/control/publish', { tape: 'T1', timeline: { version: 2, durationMs: 3_900_000 }, manifest: { kind: 'program', timelineVersion: 2, revision: 1, pageSize: 2, records: T1V2_PROG } });
   await ctl('/control/publish', { tape: 'T1', manifest: { kind: 'restoration', timelineVersion: 2, revision: 1, pageSize: 2, records: T1V2_REST } });
   note('已发布 T1 时间轴 v2：节目单 rev1（P3 移除、新增 P4）+ 修复清单 rev1（损坏位置变化）');
@@ -303,7 +366,91 @@ async function main(): Promise<void> {
     JSON.stringify(c1p4.missing.map((m: any) => m.master)) === JSON.stringify([[3_000_000, 3_300_000]]),
   );
 
-  banner('阶段 5/6 · 采集器重启：原有修订已撤下 · 已采齐复用');
+  banner('阶段 5/7 · 进程卡住接管：租约到期接手 · 晚到旧响应不覆盖新进度');
+  // 发布 T2 修复清单 rev2（4 页慢页，每页延迟 1.2s），待某进程采到 ≥2 页后把持有者 SIGSTOP 卡住
+  await ctl('/control/publish', { tape: 'T2', manifest: { kind: 'restoration', timelineVersion: 1, revision: 2, pageSize: 1, records: T2_REST_REV2 } });
+  await ctl('/control/slow-page', { tape: 'T2', kind: 'restoration', timelineVersion: 1, revision: 2, delayMs: 1200 });
+  note('已发布 T2 修复清单 rev2（4 页，每页延迟 1.2s）');
+  const rev2Of = (b: any) => b.revisions.find((x: any) => x.tapeId === 'T2' && x.kind === 'restoration' && x.revision === 2);
+  const rev2Started = await waitFor(
+    'T2 rev2 已采 ≥2 页',
+    async () => {
+      const r = rev2Of((await getStatus()).body);
+      return !!r && r.pagesDone >= 2;
+    },
+    15_000,
+  );
+  check('T2 rev2 开始采集并落库 ≥2 页', rev2Started, elapsed());
+
+  const ss5 = (await getStatus()).body;
+  const t2src = ss5.sources.find((s: any) => s.tapeId === 'T2');
+  const stalledOwner = String(t2src.owner);
+  const sessAtStall = String(t2src.sessionId);
+  const pagesAtStall = Number(rev2Of(ss5).pagesDone);
+  const procs: Record<string, ChildProcess> = { alpha: syncA, beta: syncB };
+  const survivorId = stalledOwner === 'alpha' ? 'beta' : 'alpha';
+  note(`T2 由进程 ${stalledOwner} 持有（已落库 ${pagesAtStall}/4 页）。将其 SIGSTOP 卡住——进程仍存活但不再心跳续租…`);
+  const tStall = Date.now();
+  procs[stalledOwner].kill('SIGSTOP');
+
+  let takeoverMs = -1;
+  const takenOver = await waitFor(
+    '租约易主',
+    async () => {
+      const ss = await getStatus();
+      const s = ss.body.sources.find((x: any) => x.tapeId === 'T2');
+      if (s.owner === survivorId) {
+        takeoverMs = Date.now() - tStall;
+        return true;
+      }
+      return false;
+    },
+    6_000,
+  );
+  check('卡住的进程仍存活，另一进程 3 秒内接手该来源', takenOver && takeoverMs >= 0 && takeoverMs <= 3000, `接手耗时 ${takeoverMs}ms（租约 1.5s）`);
+
+  note(`恢复被卡住的进程（SIGCONT）——其在飞请求的旧响应此刻才到达，应被租约栅栏丢弃…`);
+  procs[stalledOwner].kill('SIGCONT');
+  await sleep(700);
+  const stalledOut = ((procs[stalledOwner] as any).logLines as string[]).join('\n');
+  check('晚到的旧响应被丢弃（租约已易主）', stalledOut.includes('租约已易主，丢弃'));
+
+  const t2done = await waitFor(
+    'T2 rev2 采齐',
+    async () => {
+      const r = rev2Of((await getStatus()).body);
+      return !!r && r.status === 'complete' && r.pagesDone === 4;
+    },
+    12_000,
+  );
+  const t2View = await getTape('T2');
+  check('接手后从断点续采至采齐并生效', t2done && t2View.status === 200 && t2View.body.restorationRevision === 2, elapsed());
+
+  const t2log5 = (await ctlGet('/control/state')).body.sources.T2.log as any[];
+  const pagesAskedAfter = t2log5
+    .filter((l) => l.route === 'page-token' && l.detail.includes('restoration:1:2') && l.t >= tStall - 50)
+    .map((l) => Number(String(l.detail).match(/第(\d+)页/)?.[1]));
+  check(
+    '接手后从已落库的页之后继续（不重采已入库页）',
+    pagesAskedAfter.length > 0 && pagesAskedAfter.every((p) => p > pagesAtStall),
+    `卡住时已落库 ${pagesAtStall} 页，之后只申请第 ${pagesAskedAfter.join('、')} 页`,
+  );
+
+  const ssAfter = (await getStatus()).body;
+  const t2After = ssAfter.sources.find((s: any) => s.tapeId === 'T2');
+  const rev2After = rev2Of(ssAfter);
+  check(
+    '旧响应未覆盖新进度或会话',
+    t2After.owner !== stalledOwner && t2After.sessionId === sessAtStall && rev2After.status === 'complete' && rev2After.pagesDone === 4,
+    `会话 ${sessAtStall.slice(0, 8)}… 保持不变，进度 ${rev2After.pagesDone}/4`,
+  );
+  const c1t2 = t2View.body.copies.find((c: any) => c.copyId === 'C1');
+  check(
+    'T2 rev2 缺失区段正确（C1 缺 00:08:20–00:10:00）',
+    JSON.stringify(c1t2.missing.map((m: any) => m.master)) === JSON.stringify([[500_000, 600_000]]),
+  );
+
+  banner('阶段 6/7 · 采集器重启：原有修订已撤下 · 已采齐复用');
   await ctl('/control/withdraw', { tape: 'T1', kind: 'program', timelineVersion: 1, revision: 1 });
   await ctl('/control/withdraw', { tape: 'T1', kind: 'program', timelineVersion: 1, revision: 2 });
   await ctl('/control/withdraw', { tape: 'T1', kind: 'restoration', timelineVersion: 1, revision: 1 });
@@ -312,8 +459,9 @@ async function main(): Promise<void> {
   const pageReqsBefore = (await ctlGet('/control/state')).body.sources.T1.log.filter((l: any) => l.route === 'page').length;
   const beforeKill = await getProg('T1', 'P4');
 
-  syncProc.kill('SIGKILL');
-  note('已强制终止采集器（SIGKILL），1 秒后重启…');
+  syncA.kill('SIGKILL');
+  syncB.kill('SIGKILL');
+  note('已强制终止两个采集进程（SIGKILL），1 秒后重启…');
   await sleep(1_000);
   const during = await getProg('T1', 'P4');
   check(
@@ -321,7 +469,8 @@ async function main(): Promise<void> {
     during.status === 200 && JSON.stringify(during.body) === JSON.stringify(beforeKill.body),
   );
 
-  syncProc = startProc('sync', 'sync.ts', { SITE_URL: SITE, DB_PATH: DB, POLL_MS: '250' });
+  syncA = startProc('syncA', 'sync.ts', syncEnv('alpha'));
+  syncB = startProc('syncB', 'sync.ts', syncEnv('beta'));
   const t3Active = await waitFor('T3 生效', async () => (await getTape('T3')).status === 200, 15_000);
   check('重启后 T3 修复清单 rev2 采齐，T3 生效', t3Active, elapsed());
   const t1After = await getTape('T1');
@@ -329,15 +478,20 @@ async function main(): Promise<void> {
   const pageReqsAfter = (await ctlGet('/control/state')).body.sources.T1.log.filter((l: any) => l.route === 'page').length;
   check('已采齐的修订可复用，未重复抓取', pageReqsAfter === pageReqsBefore, `T1 页面请求 ${pageReqsBefore} → ${pageReqsAfter} 次`);
 
-  banner('阶段 6/6 · 节目定位结果展示');
+  banner('阶段 7/7 · 节目定位结果展示');
   note('按母带查询（GET /tapes/T1）：');
   printTapeView((await getTape('T1')).body);
   note('按节目跨库查询（GET /programs/R2 → T3）：');
   printProgramView((await httpReq('GET', `${API}/programs/R2`)).body.results[0]);
   note('同步状态（GET /sync/status）：');
   const ss = (await getStatus()).body;
+  note(`在线采集进程：${ss.workers.map((w: any) => w.workerId).join('、') || '无'}`);
   for (const s of ss.sources) {
-    console.log(`    来源 ${s.tapeId}：会话 ${s.sessionId ? `${String(s.sessionId).slice(0, 8)}…` : '无'}${s.pausedUntil && s.pausedUntil > Date.now() ? ` · 暂停至 ${new Date(s.pausedUntil).toISOString()}` : ''}`);
+    console.log(
+      `    来源 ${s.tapeId}：会话 ${s.sessionId ? `${String(s.sessionId).slice(0, 8)}…` : '无'}` +
+        ` · 持有者 ${s.owner ?? '无'}（租约代 ${s.leaseEpoch}）` +
+        `${s.pausedUntil && s.pausedUntil > Date.now() ? ` · 暂停至 ${new Date(s.pausedUntil).toISOString()}` : ''}`,
+    );
   }
   for (const r of ss.revisions) {
     const dmg = r.damages.length ? ` · 损坏记录 ${r.damages.map((d: any) => `${fmtMs(d.masterRange[0])}–${fmtMs(d.masterRange[1])}`).join('、')}` : '';

@@ -2,10 +2,13 @@
  * SQLite 持久层。
  *
  * 表设计：
- * - sources：每个来源（母带）的采集会话状态（暂停截止、会话、签名令牌），重启后可恢复。
+ * - sources：每个来源（母带）的采集会话状态（暂停截止、会话、签名令牌、租约），重启后可恢复。
+ *   同一数据库可跑多个采集进程：租约（owner/epoch/expires_at）把来源分给活着的进程，
+ *   会话与签名令牌按租约代（epoch）隔离，晚到的旧代响应不会覆盖新一代的进度或会话。
+ * - workers：采集进程心跳登记表，崩溃的进程租约到期后被其他进程接手。
  * - timelines：母带各时间轴版次的时长。
  * - revisions：站点通告过的每次清单修订；status: pending/collecting/complete/abandoned。
- * - pages：页级断点，已入库的页不重采（采集恢复的关键）。
+ * - pages：页级断点，已入库的页不重采（采集恢复与多进程接手的关键）。
  * - programs / segments / damages：按 revision_id 归属的清单记录，修订不可变。
  * - activations：每盘母带当前生效的「时间轴版次 + 节目单修订 + 修复清单修订」指针。
  *   生效切换在单个事务内完成，查询按指针一次读出，保证播放位置与缺失区段同生同灭。
@@ -14,8 +17,9 @@ import { DatabaseSync } from 'node:sqlite';
 
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
-  db.exec('PRAGMA journal_mode = WAL');
+  // busy_timeout 必须最先设置：多进程同时打开同一库时，随后的 journal_mode/建表会互相等待
   db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA journal_mode = WAL');
   migrate(db);
   return db;
 }
@@ -26,7 +30,17 @@ function migrate(db: DatabaseSync): void {
       tape_id TEXT PRIMARY KEY,
       paused_until INTEGER,
       session_id TEXT,
-      sign_token TEXT
+      sign_token TEXT,
+      session_lease_epoch INTEGER NOT NULL DEFAULT 0,
+      owner_id TEXT,
+      lease_epoch INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS workers (
+      worker_id TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      started_at INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS timelines (
       tape_id TEXT NOT NULL,
@@ -84,6 +98,15 @@ function migrate(db: DatabaseSync): void {
       activated_at INTEGER NOT NULL
     );
   `);
+  // 兼容旧库：为已存在的 sources 表补充租约列
+  const cols = (db.prepare('PRAGMA table_info(sources)').all() as any[]).map((c) => c.name as string);
+  const addCol = (name: string, ddl: string) => {
+    if (!cols.includes(name)) db.exec(`ALTER TABLE sources ADD COLUMN ${ddl}`);
+  };
+  addCol('session_lease_epoch', 'session_lease_epoch INTEGER NOT NULL DEFAULT 0');
+  addCol('owner_id', 'owner_id TEXT');
+  addCol('lease_epoch', 'lease_epoch INTEGER NOT NULL DEFAULT 0');
+  addCol('lease_expires_at', 'lease_expires_at INTEGER NOT NULL DEFAULT 0');
 }
 
 /** 单事务执行；生效指针切换与清单入库在同一事务，查询侧永远读到一致快照 */

@@ -32,6 +32,7 @@ interface Manifest extends ManifestSeed {
   listed: boolean;
   withdrawAfterPage: number | null;
   losePages: Map<number, number>; // page -> 剩余丢响应次数
+  delayMs: number; // 取页响应前的人为延迟（模拟慢页）
 }
 interface LogEntry {
   t: number;
@@ -86,6 +87,7 @@ function addManifest(tapeId: string, seed: ManifestSeed): void {
     listed: true,
     withdrawAfterPage: null,
     losePages: new Map(),
+    delayMs: 0,
   });
 }
 
@@ -309,12 +311,17 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return;
     }
     const layout: 'table' | 'cards' = tk.page % 2 === 0 ? 'table' : 'cards';
-    slog(src, 'page', `${tk.key} 第${tk.page + 1}页 发出（${layout} 排版）`);
-    if (mf.withdrawAfterPage === tk.page) {
-      mf.listed = false;
-      slog(src, 'withdraw', `${tk.key} 发出第${tk.page + 1}页后撤下`);
-    }
-    send(res, 200, renderPage(mf, tk.page, layout));
+    const payload = renderPage(mf, tk.page, layout);
+    const emit = () => {
+      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 发出（${layout} 排版）${mf.delayMs > 0 ? `（慢页延迟 ${mf.delayMs}ms）` : ''}`);
+      if (mf.withdrawAfterPage === tk.page) {
+        mf.listed = false;
+        slog(src, 'withdraw', `${tk.key} 发出第${tk.page + 1}页后撤下`);
+      }
+      send(res, 200, payload);
+    };
+    if (mf.delayMs > 0) setTimeout(emit, mf.delayMs);
+    else emit();
     return;
   }
 
@@ -373,6 +380,15 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
     const mf = src?.manifests.get(keyOf(body.kind, body.timelineVersion, body.revision));
     if (!src || !mf) return send(res, 404, { error: 'UNKNOWN_MANIFEST' });
     mf.losePages.set(Number(body.page), Number(body.times ?? 1));
+    send(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/control/slow-page' && req.method === 'POST') {
+    const src = state.sources.get(body.tape);
+    const mf = src?.manifests.get(keyOf(body.kind, body.timelineVersion, body.revision));
+    if (!src || !mf) return send(res, 404, { error: 'UNKNOWN_MANIFEST' });
+    mf.delayMs = Number(body.delayMs ?? 0);
+    slog(src, 'slow-page', `${body.kind}:${body.timelineVersion}:${body.revision} 取页延迟设为 ${mf.delayMs}ms`);
     send(res, 200, { ok: true });
     return;
   }

@@ -121,10 +121,19 @@ function programView(tape: string, pid: string): { status: number; body: any } {
 }
 
 function syncStatus(): any {
+  const now = Date.now();
   const sources = (db.prepare('SELECT * FROM sources ORDER BY tape_id').all() as any[]).map((s) => ({
     tapeId: s.tape_id,
     pausedUntil: s.paused_until,
     sessionId: s.session_id,
+    owner: s.lease_expires_at > now ? s.owner_id : null,
+    leaseEpoch: s.lease_epoch,
+    leaseExpiresAt: s.lease_expires_at || null,
+  }));
+  const workers = (db.prepare('SELECT * FROM workers ORDER BY worker_id').all() as any[]).map((w) => ({
+    workerId: w.worker_id,
+    pid: w.pid,
+    lastSeen: w.last_seen,
   }));
   const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, kind, revision').all() as any[]).map((r) => ({
     tapeId: r.tape_id,
@@ -146,7 +155,7 @@ function syncStatus(): any {
     tapeId: a.tape_id,
     timelineVersion: a.timeline_version,
   }));
-  return { sources, revisions, activations };
+  return { sources, workers, revisions, activations };
 }
 
 const HELP = {
