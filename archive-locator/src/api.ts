@@ -121,10 +121,16 @@ function programView(tape: string, pid: string): { status: number; body: any } {
 }
 
 function syncStatus(): any {
+  const now = Date.now();
   const sources = (db.prepare('SELECT * FROM sources ORDER BY tape_id').all() as any[]).map((s) => ({
     tapeId: s.tape_id,
     pausedUntil: s.paused_until,
+    paused: !!s.paused_until && s.paused_until > now,
     sessionId: s.session_id,
+    leaseOwner: s.lease_owner,
+    leaseFence: s.lease_fence,
+    leaseExpires: s.lease_expires,
+    leaseActive: !!s.lease_owner && s.lease_expires > now,
   }));
   const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, kind, revision').all() as any[]).map((r) => ({
     tapeId: r.tape_id,
@@ -146,7 +152,11 @@ function syncStatus(): any {
     tapeId: a.tape_id,
     timelineVersion: a.timeline_version,
   }));
-  return { sources, revisions, activations };
+  // 跨进程租约事件（接管 / 迟到写入被拒），最近 50 条
+  const events = (
+    db.prepare('SELECT t, tape_id, owner, fence, kind, detail FROM sync_events ORDER BY id DESC LIMIT 50').all() as any[]
+  ).map((e) => ({ t: e.t, tapeId: e.tape_id, owner: e.owner, fence: e.fence, kind: e.kind, detail: e.detail }));
+  return { sources, revisions, activations, events };
 }
 
 const HELP = {

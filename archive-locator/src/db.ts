@@ -9,13 +9,17 @@
  * - programs / segments / damages：按 revision_id 归属的清单记录，修订不可变。
  * - activations：每盘母带当前生效的「时间轴版次 + 节目单修订 + 修复清单修订」指针。
  *   生效切换在单个事务内完成，查询按指针一次读出，保证播放位置与缺失区段同生同灭。
+ * - sources.lease_*：跨进程的「按来源」采集租约。不同来源可由不同进程并行采集；
+ *   同一来源同一时刻只有一个进程发请求。租约带单调递增的 fence，进程被挂起后
+ *   租约到期由另一进程接管并抬高 fence，旧进程恢复后的迟到响应写入一律被拒。
+ * - sync_events：租约接管 / 迟到写入被拒等跨进程事件，便于验证与排障。
  */
 import { DatabaseSync } from 'node:sqlite';
 
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL');
-  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA busy_timeout = 1000');
   migrate(db);
   return db;
 }
@@ -83,7 +87,21 @@ function migrate(db: DatabaseSync): void {
       restoration_revision_id INTEGER NOT NULL,
       activated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS sync_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      t INTEGER NOT NULL,
+      tape_id TEXT NOT NULL,
+      owner TEXT,
+      fence INTEGER,
+      kind TEXT NOT NULL,              -- takeover | stale-write（租约接管 / 迟到写入被拒）
+      detail TEXT NOT NULL
+    );
   `);
+  // 旧库平滑升级：补充跨进程租约列（sources 是唯一被多进程写入的表）
+  const cols = new Set((db.prepare('PRAGMA table_info(sources)').all() as any[]).map((c) => c.name));
+  if (!cols.has('lease_owner')) db.exec('ALTER TABLE sources ADD COLUMN lease_owner TEXT');
+  if (!cols.has('lease_expires')) db.exec('ALTER TABLE sources ADD COLUMN lease_expires INTEGER NOT NULL DEFAULT 0');
+  if (!cols.has('lease_fence')) db.exec('ALTER TABLE sources ADD COLUMN lease_fence INTEGER NOT NULL DEFAULT 0');
 }
 
 /** 单事务执行；生效指针切换与清单入库在同一事务，查询侧永远读到一致快照 */
@@ -203,3 +221,133 @@ function damageNote(damages: DamageRow[], a: number, b: number): string | null {
   const d = damages.find((x) => x.master_start_ms <= a && x.master_end_ms >= b);
   return d ? d.note : null;
 }
+
+// ---------------------------------------------------------------------------
+// 跨进程采集租约（按来源）
+//
+// 不变量：
+// - 同一来源同一时刻最多一个进程持有租约，也就最多一个进程向该来源发请求。
+// - 不同来源的租约互相独立，可由不同进程并行持有。
+// - 租约带单调递增的 fence；进程被挂起后租约到期、被另一进程以更高 fence 接管。
+//   旧进程恢复后仍以旧 fence 写入，一律被拒（既不能推进也不能回退进度，也不能覆盖会话）。
+// ---------------------------------------------------------------------------
+
+export interface Lease {
+  tapeId: string;
+  owner: string;
+  fence: number;
+  expires: number;
+}
+
+/** 写入时发现租约已失效（被接管 / 已过期） */
+export class LeaseLostError extends Error {
+  readonly tapeId: string;
+  constructor(tapeId: string) {
+    super(`来源 ${tapeId} 的采集租约已失效`);
+    this.name = 'LeaseLostError';
+    this.tapeId = tapeId;
+  }
+}
+
+export function recordEvent(
+  db: DatabaseSync,
+  tapeId: string,
+  owner: string | null,
+  fence: number | null,
+  kind: string,
+  detail: string,
+): void {
+  try {
+    db.prepare('INSERT INTO sync_events (t, tape_id, owner, fence, kind, detail) VALUES (?,?,?,?,?,?)').run(
+      Date.now(), tapeId, owner, fence, kind, detail,
+    );
+    db.prepare('DELETE FROM sync_events WHERE id <= (SELECT MAX(id) FROM sync_events) - 2000').run();
+  } catch {
+    /* 事件只用于排障，写失败不影响采集 */
+  }
+}
+
+/**
+ * 取得（或续约）某来源的租约，单事务内判定，避免两进程同时接管。
+ * - 自己仍持有效租约：续期，fence 不变。
+ * - 无人持有或已到期：接管，fence + 1。
+ * - 他人持有且未到期：返回 null（本进程本轮跳过该来源）。
+ */
+export function acquireLease(db: DatabaseSync, tapeId: string, owner: string, ttlMs: number): Lease | null {
+  return withTx(db, () => {
+    const now = Date.now();
+    db.prepare('INSERT OR IGNORE INTO sources (tape_id) VALUES (?)').run(tapeId);
+    const row = db
+      .prepare('SELECT lease_owner AS o, lease_expires AS e, lease_fence AS f FROM sources WHERE tape_id = ?')
+      .get(tapeId) as any;
+    if (row.o === owner && row.e > now) {
+      const expires = now + ttlMs;
+      db.prepare('UPDATE sources SET lease_expires = ? WHERE tape_id = ?').run(expires, tapeId);
+      return { tapeId, owner, fence: row.f, expires };
+    }
+    if (row.o && row.e > now) return null;
+    const fence = row.f + 1;
+    const expires = now + ttlMs;
+    db.prepare('UPDATE sources SET lease_owner = ?, lease_expires = ?, lease_fence = ? WHERE tape_id = ?')
+      .run(owner, expires, fence, tapeId);
+    if (row.o) {
+      recordEvent(
+        db, tapeId, owner, fence, 'takeover',
+        `从 ${row.o} 接手（租约已到期 ${Math.max(0, now - row.e)}ms，fence ${row.f} → ${fence}）`,
+      );
+    }
+    return { tapeId, owner, fence, expires };
+  });
+}
+
+/** 续约；返回 false 表示租约已过期/被接管，调用方应立即停止该来源的后续请求 */
+export function renewLease(db: DatabaseSync, lease: Lease, ttlMs: number): boolean {
+  const now = Date.now();
+  const r = db
+    .prepare(
+      `UPDATE sources SET lease_expires = ?
+       WHERE tape_id = ? AND lease_owner = ? AND lease_fence = ? AND lease_expires > ?`,
+    )
+    .run(now + ttlMs, lease.tapeId, lease.owner, lease.fence, now);
+  return Number(r.changes) > 0;
+}
+
+/** 主动让出租约（不抬高 fence）；迟到写入仍会因 owner/fence 不匹配被拒 */
+export function releaseLease(db: DatabaseSync, lease: Lease): void {
+  try {
+    db.prepare(
+      'UPDATE sources SET lease_owner = NULL, lease_expires = 0 WHERE tape_id = ? AND lease_owner = ? AND lease_fence = ?',
+    ).run(lease.tapeId, lease.owner, lease.fence);
+  } catch {
+    /* 让出失败无妨，租约到期后自然可被接管 */
+  }
+}
+
+/**
+ * 围栏写入：仅在租约仍归本进程且未过期时执行 fn（fn 内所有写入与检查在同一事务）。
+ * 迟到的响应会在这里被整体拒绝，不会留下半截写入。
+ */
+export function fencedWrite<T>(db: DatabaseSync, lease: Lease, fn: () => T): T {
+  let row: any;
+  try {
+    return withTx(db, () => {
+      const now = Date.now();
+      row = db
+        .prepare('SELECT lease_owner AS o, lease_fence AS f, lease_expires AS e FROM sources WHERE tape_id = ?')
+        .get(lease.tapeId) as any;
+      if (!row || row.o !== lease.owner || row.f !== lease.fence || row.e <= now) {
+        throw new LeaseLostError(lease.tapeId);
+      }
+      return fn();
+    });
+  } catch (e) {
+    if (e instanceof LeaseLostError) {
+      recordEvent(
+        db, lease.tapeId, lease.owner, lease.fence, 'stale-write',
+        `丢弃失去租约后的迟到写入（现行 owner=${row?.o ?? '无'} fence=${row?.f ?? '-'}）`,
+      );
+    }
+    throw e;
+  }
+}
+

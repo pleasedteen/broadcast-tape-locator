@@ -37,11 +37,13 @@ interface LogEntry {
   t: number;
   route: string;
   detail: string;
+  by?: string | null; // 发起该请求的采集器进程（x-sync-owner）
 }
 interface Source {
   tapeId: string;
   pausedUntil: number;
   epoch: number; // 每次暂停 +1，使旧会话失效
+  pageDelayMs: number; // 取页响应的人为延迟（用于制造挂起/接管窗口）
   sessions: Map<string, Session>;
   timelines: Map<number, number>; // 时间轴版次 -> 时长 ms
   manifests: Map<string, Manifest>;
@@ -56,9 +58,9 @@ const state = {
 const keyOf = (kind: string, v: number, r: number) => `${kind}:${v}:${r}`;
 const pageCountOf = (m: Manifest) => Math.max(1, Math.ceil(m.records.length / m.pageSize));
 
-function slog(src: Source | null, route: string, detail: string): void {
+function slog(src: Source | null, route: string, detail: string, by: string | null = null): void {
   if (src) {
-    src.log.push({ t: Date.now(), route, detail });
+    src.log.push({ t: Date.now(), route, detail, by });
     if (src.log.length > 500) src.log.shift();
   }
   console.log(`[site] ${src?.tapeId ?? '-'} ${route} ${detail}`);
@@ -69,6 +71,7 @@ function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
     tapeId,
     pausedUntil: 0,
     epoch: 1,
+    pageDelayMs: 0,
     sessions: new Map(),
     timelines: new Map(timelines),
     manifests: new Map(),
@@ -185,23 +188,23 @@ function readJson(req: http.IncomingMessage): Promise<any> {
 }
 
 // ---------- 业务路由 ----------
-function guardSource(res: http.ServerResponse, tape: string): Source | null {
+function guardSource(res: http.ServerResponse, tape: string, by: string | null = null): Source | null {
   const src = state.sources.get(tape) ?? null;
   if (!src) {
     send(res, 404, { error: 'UNKNOWN_TAPE' });
     return null;
   }
   if (Date.now() < src.pausedUntil) {
-    slog(src, 'blocked', `来源暂停中 → 423（至 ${new Date(src.pausedUntil).toISOString()}）`);
+    slog(src, 'blocked', `来源暂停中 → 423（至 ${new Date(src.pausedUntil).toISOString()}）`, by);
     send(res, 423, { error: 'PAUSED', pausedUntil: src.pausedUntil });
     return null;
   }
   return src;
 }
-function guardSession(res: http.ServerResponse, src: Source, sessionId: string): Session | null {
+function guardSession(res: http.ServerResponse, src: Source, sessionId: string, by: string | null = null): Session | null {
   const sess = src.sessions.get(sessionId);
   if (!sess || sess.epoch !== src.epoch) {
-    slog(src, 'auth', `会话无效 → 401（${sessionId ?? '无'}）`);
+    slog(src, 'auth', `会话无效 → 401（${sessionId ?? '无'}）`, by);
     send(res, 401, { error: 'SESSION_INVALID' });
     return null;
   }
@@ -209,6 +212,7 @@ function guardSession(res: http.ServerResponse, src: Source, sessionId: string):
 }
 
 async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+  const by = (req.headers['x-sync-owner'] as string | undefined) ?? null;
   if (url.pathname === '/api/sources' && req.method === 'GET') {
     send(res, 200, { tapes: [...state.sources.keys()] });
     return;
@@ -219,7 +223,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return;
   }
   const [, tape, route] = m;
-  const src = guardSource(res, tape);
+  const src = guardSource(res, tape, by);
   if (!src) return;
 
   if (route === 'session' && req.method === 'POST') {
@@ -227,18 +231,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     state.signToken = randomToken();
     const sess: Session = { id: randomToken(), epoch: src.epoch, tokens: new Map() };
     src.sessions.set(sess.id, sess);
-    slog(src, 'session', `发放新会话 ${sess.id}（签名令牌轮换为 ${state.signToken.slice(0, 8)}…）`);
+    slog(src, 'session', `发放新会话 ${sess.id}（签名令牌轮换为 ${state.signToken.slice(0, 8)}…）`, by);
     send(res, 200, { sessionId: sess.id, signToken: state.signToken });
     return;
   }
 
   const body = req.method === 'POST' ? await readJson(req) : null;
   const sessionId = url.searchParams.get('sessionId') ?? body?.sessionId ?? '';
-  const sess = guardSession(res, src, sessionId);
+  const sess = guardSession(res, src, sessionId, by);
   if (!sess) return;
 
   if (route === 'index' && req.method === 'GET') {
-    slog(src, 'index', '拉取索引');
+    slog(src, 'index', '拉取索引', by);
     send(res, 200, {
       signToken: state.signToken,
       timelines: [...src.timelines.entries()].map(([version, durationMs]) => ({ version, durationMs })),
@@ -259,7 +263,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     const key = keyOf(body.kind, body.timelineVersion, body.revision);
     const mf = src.manifests.get(key);
     if (!mf || !mf.listed) {
-      slog(src, 'page-token', `${key} 已撤下 → 410`);
+      slog(src, 'page-token', `${key} 已撤下 → 410`, by);
       send(res, 410, { error: 'WITHDRAWN' });
       return;
     }
@@ -269,7 +273,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     const tk: PageTokenRec = { id: randomToken(), key, page: body.page, consumed: false };
     sess.tokens.set(tk.id, tk);
-    slog(src, 'page-token', `${key} 第${body.page + 1}页 签发翻页令牌 ${tk.id.slice(0, 8)}…`);
+    slog(src, 'page-token', `${key} 第${body.page + 1}页 签发翻页令牌 ${tk.id.slice(0, 8)}…`, by);
     send(res, 200, { pageToken: tk.id, signToken: state.signToken });
     return;
   }
@@ -280,7 +284,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     // 翻页签名随站点刚发出的签名令牌和当前会话变化
     const expect = sha256(`${state.signToken}|${sessionId}|${pageToken}`);
     if (sig !== expect) {
-      slog(src, 'page', '签名令牌不是最新 → 409（附新令牌）');
+      slog(src, 'page', '签名令牌不是最新 → 409（附新令牌）', by);
       send(res, 409, { error: 'STALE_SIGN_TOKEN', signToken: state.signToken });
       return;
     }
@@ -290,13 +294,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return;
     }
     if (tk.consumed) {
-      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 翻页令牌已消费 → 409`);
+      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 翻页令牌已消费 → 409`, by);
       send(res, 409, { error: 'PAGE_TOKEN_CONSUMED' });
       return;
     }
     const mf = src.manifests.get(tk.key);
     if (!mf || !mf.listed) {
-      slog(src, 'page', `${tk.key} 已撤下 → 410`);
+      slog(src, 'page', `${tk.key} 已撤下 → 410`, by);
       send(res, 410, { error: 'WITHDRAWN' });
       return;
     }
@@ -304,15 +308,16 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     const loses = mf.losePages.get(tk.page) ?? 0;
     if (loses > 0) {
       mf.losePages.set(tk.page, loses - 1);
-      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 响应丢失（翻页令牌已消费）`);
+      slog(src, 'page', `${tk.key} 第${tk.page + 1}页 响应丢失（翻页令牌已消费）`, by);
       req.socket.destroy();
       return;
     }
     const layout: 'table' | 'cards' = tk.page % 2 === 0 ? 'table' : 'cards';
-    slog(src, 'page', `${tk.key} 第${tk.page + 1}页 发出（${layout} 排版）`);
+    if (src.pageDelayMs > 0) await new Promise((r) => setTimeout(r, src.pageDelayMs));
+    slog(src, 'page', `${tk.key} 第${tk.page + 1}页 发出（${layout} 排版）`, by);
     if (mf.withdrawAfterPage === tk.page) {
       mf.listed = false;
-      slog(src, 'withdraw', `${tk.key} 发出第${tk.page + 1}页后撤下`);
+      slog(src, 'withdraw', `${tk.key} 发出第${tk.page + 1}页后撤下`, by);
     }
     send(res, 200, renderPage(mf, tk.page, layout));
     return;
@@ -332,6 +337,7 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
       sources[id] = {
         pausedUntil: s.pausedUntil,
         epoch: s.epoch,
+        pageDelayMs: s.pageDelayMs,
         sessions: [...s.sessions.keys()],
         manifests: [...s.manifests.entries()].map(([key, x]) => ({
           key, listed: x.listed, pageCount: pageCountOf(x), recordCount: x.records.length,
@@ -340,6 +346,14 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
       };
     }
     send(res, 200, { signToken: state.signToken, sources });
+    return;
+  }
+  if (path === '/control/add-source' && req.method === 'POST') {
+    if (state.sources.has(body.tape)) return send(res, 409, { error: 'EXISTS' });
+    const timelines = (body.timelines ?? [{ version: 1, durationMs: 3_600_000 }]).map((t: any) => [Number(t.version), Number(t.durationMs)] as [number, number]);
+    addSource(body.tape, timelines);
+    slog(state.sources.get(body.tape)!, 'source', `新增来源（时间轴 ${timelines.map(([v]) => 'v' + v).join(',')}）`);
+    send(res, 200, { ok: true });
     return;
   }
   if (path === '/control/pause' && req.method === 'POST') {
@@ -384,6 +398,14 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
     addManifest(body.tape, mf);
     slog(src, 'publish', `${mf.kind} v${mf.timelineVersion} rev${mf.revision} 已发布（${mf.records.length} 条记录）`);
     send(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/control/delay' && req.method === 'POST') {
+    const src = state.sources.get(body.tape);
+    if (!src) return send(res, 404, { error: 'UNKNOWN_TAPE' });
+    src.pageDelayMs = Number(body.ms ?? 0);
+    slog(src, 'delay', `取页响应延迟设为 ${src.pageDelayMs}ms`);
+    send(res, 200, { ok: true, pageDelayMs: src.pageDelayMs });
     return;
   }
   if (path === '/control/rotate-token' && req.method === 'POST') {

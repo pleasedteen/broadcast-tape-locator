@@ -9,6 +9,8 @@
  *   阶段 4  新时间轴版次 v2 生效；被新版清单移除的记录随修订撤下
  *   阶段 5  采集器重启：原有修订已撤下；已采齐修订复用不重采；查询持续可用
  *   阶段 6  节目定位结果展示
+ *   阶段 7  双进程共库：挂起一个采集器后另一进程 2 秒内接手首个未入库页；
+ *           旧进程恢复后的迟到响应不推进/回退进度、不覆盖会话；暂停状态换进程同样生效
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync, rmSync } from 'node:fs';
@@ -154,12 +156,236 @@ const T3_REST_REV2: Rec[] = [
   { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 900_000, copyStartMs: 0, rate: 1 },
 ];
 
+
+// ---------- 阶段 7：双进程共库 ----------
+const T4_PROG_REV1: Rec[] = [
+  { type: 'program', programId: 'S1', title: '长篇连播·上', startMs: 0, endMs: 900_000 },
+  { type: 'program', programId: 'S2', title: '长篇连播·中', startMs: 900_000, endMs: 1_800_000 },
+  { type: 'program', programId: 'S3', title: '长篇连播·下', startMs: 1_800_000, endMs: 2_700_000 },
+  { type: 'program', programId: 'S4', title: '尾声', startMs: 2_700_000, endMs: 3_600_000 },
+];
+const T4_REST_REV1: Rec[] = [
+  { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 1_000_000, copyStartMs: 0, rate: 1 },
+  { type: 'damage', copyId: 'C1', masterStartMs: 1_000_000, masterEndMs: 1_100_000, note: '片头氧化' },
+  { type: 'segment', copyId: 'C1', masterStartMs: 1_100_000, masterEndMs: 2_200_000, copyStartMs: 1_000_000, rate: 1 },
+  { type: 'segment', copyId: 'C1', masterStartMs: 2_200_000, masterEndMs: 3_600_000, copyStartMs: 2_100_000, rate: 1 },
+];
+const T4V2_PROG: Rec[] = [
+  { type: 'program', programId: 'S1', title: '长篇连播·上', startMs: 0, endMs: 900_000 },
+  { type: 'program', programId: 'S5', title: '新补片段', startMs: 900_000, endMs: 1_800_000 },
+  { type: 'program', programId: 'S6', title: '新补片段·续', startMs: 1_800_000, endMs: 3_600_000 },
+];
+const T4V2_REST: Rec[] = [
+  { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 2_500_000, copyStartMs: 0, rate: 1 },
+  { type: 'damage', copyId: 'C1', masterStartMs: 2_500_000, masterEndMs: 2_700_000, note: '新发现缺损' },
+  { type: 'segment', copyId: 'C1', masterStartMs: 2_700_000, masterEndMs: 3_600_000, copyStartMs: 2_500_000, rate: 1 },
+];
+
+const pauseProc = (c: ChildProcess) => { try { process.kill(c.pid!, 'SIGSTOP'); } catch { /* ignore */ } };
+const resumeProc = (c: ChildProcess) => { try { process.kill(c.pid!, 'SIGCONT'); } catch { /* ignore */ } };
+const killProc = (c: ChildProcess) => { try { c.kill('SIGKILL'); } catch { /* ignore */ } };
+
+function syncOpts(owner: string): Record<string, string> {
+  return { SITE_URL: SITE, DB_PATH: DB, POLL_MS: '100', SYNC_OWNER: owner, LEASE_TTL_MS: '800' };
+}
+
+async function statusOf(): Promise<any> {
+  return (await getStatus()).body;
+}
+async function t4Rev(kind: string): Promise<any> {
+  return (await statusOf()).revisions.find((r: any) => r.tapeId === 'T4' && r.kind === kind);
+}
+async function t4Source(): Promise<any> {
+  return (await statusOf()).sources.find((x: any) => x.tapeId === 'T4');
+}
+/** 站点日志里某来源在 [since, now] 内、由采集器发出的请求（排除控制/事件类） */
+async function t4ApiReqs(since: number): Promise<any[]> {
+  const st = await ctlGet('/control/state');
+  const log = (st.body.sources.T4?.log ?? []) as any[];
+  const API = new Set(['session', 'index', 'page-token', 'page', 'auth', 'blocked']);
+  return log.filter((l) => l.t >= since && API.has(l.route));
+}
+
+async function runDualProcessScenario(): Promise<void> {
+  banner('阶段 7/8 · 双进程共库：挂起后接手 · 迟到响应丢弃 · 暂停换进程生效');
+  // 停掉阶段 5 重启的采集器：阶段 7 改由两个受控进程 A/B 共用同一库
+  for (const c of children.slice()) {
+    if (c.pid && c.spawnargs?.join(' ').includes('sync.ts')) killProc(c);
+  }
+  await sleep(400);
+
+  // 新增 60 分钟母带 T4：节目单 4 页、修复清单 2 页，便于观察挂起与接手
+  await ctl('/control/add-source', { tape: 'T4', timelines: [{ version: 1, durationMs: 3_600_000 }] });
+  await ctl('/control/publish', { tape: 'T4', manifest: { kind: 'program', timelineVersion: 1, revision: 1, pageSize: 1, records: T4_PROG_REV1 } });
+  await ctl('/control/publish', { tape: 'T4', manifest: { kind: 'restoration', timelineVersion: 1, revision: 1, pageSize: 2, records: T4_REST_REV1 } });
+  // 取页响应人为延迟 1.5s：让采集器稳定地卡在两页之间，便于在确定位置挂起，
+  // 并保证旧进程恢复后在超时前拿到那页响应，从而真正走到「迟到写入被拒」路径
+  await ctl('/control/delay', { tape: 'T4', ms: 1500 });
+  note('已上架 T4（节目单 4 页 + 修复清单 2 页），取页响应人为延迟 1.5s 以制造挂起窗口');
+
+  // 进程 A 独立采集 T4；两个进程都处理全部来源，靠租约保证同一来源只被一个进程发请求
+  const A = startProc('syncA', 'sync.ts', syncOpts('A'));
+  const gotPage1 = await waitFor(
+    'A 采集 T4 节目单第 1 页',
+    async () => {
+      const src = await t4Source();
+      const rev = await t4Rev('program');
+      return src?.leaseOwner === 'A' && rev?.pagesDone === 1;
+    },
+    10_000,
+  );
+  pauseProc(A);
+  const pausedAt = Date.now();
+  note(`已挂起采集器 A（SIGSTOP），其租约将停止续约（${new Date(pausedAt).toISOString().slice(11, 23)}）`);
+  check('A 挂起前已入库 T4 节目单第 1 页', gotPage1);
+
+  // 起进程 B：应在 A 的租约到期后 2 秒内接手，并从首个未入库页（第 2 页）续采
+  const B = startProc('syncB', 'sync.ts', syncOpts('B'));
+  const firstPageByB = await waitFor(
+    'B 接手 T4 并请取首个未入库页',
+    async () => {
+      const src = await t4Source();
+      const st = await ctlGet('/control/state');
+      const log = (st.body.sources.T4?.log ?? []) as any[];
+      return src?.leaseOwner === 'B' && log.some((l) => l.by === 'B' && l.route === 'page-token');
+    },
+    3_000,
+  );
+  const takeoverMs = Date.now() - pausedAt;
+  check('挂起后另一进程 2 秒内接手首个未入库页', firstPageByB && takeoverMs <= 2000, `接手耗时 ${takeoverMs}ms`);
+  const evTake = (await statusOf()).events.find((e: any) => e.tapeId === 'T4' && e.kind === 'takeover');
+  check('记录接管事件并抬高 fence（旧进程写入将被拒）', !!evTake, evTake?.detail ?? '无事件');
+  // 接管期间定位继续可用
+  check(
+    '接管期间定位继续可用（T1/T3 查询正常）',
+    (await getProg('T1', 'P2')).status === 200 && (await getTape('T3')).status === 200,
+  );
+
+  // 趁 A 仍挂着、其第 2 页响应尚未返回时恢复 A：该响应回来时 A 的租约已被 B 接管，
+  // 写入必须被围栏整体拒绝（这是本阶段要验证的「迟到响应」）。
+  resumeProc(A);
+  note('已恢复采集器 A（SIGCONT）：它在挂起前发出的第 2 页响应即将迟到抵达');
+  const bSecondPage = await waitFor(
+    'B 从首个未入库页续采',
+    async () => {
+      const rev = await t4Rev('program');
+      return !!rev && rev.pagesDone >= 2;
+    },
+    6_000,
+  );
+  check('B 从首个未入库页续采（不重采已入库页）', bSecondPage);
+
+  // B 采齐 T4 v1 并按既有版次规则切换
+  const t4Done = await waitFor('B 采齐 T4 v1', async () => (await getTape('T4')).status === 200, 15_000);
+  check('接手进程采齐后按已有版次规则切换播放区间与缺口', t4Done, elapsed());
+  const t4v1 = await getTape('T4');
+  const progBefore = `${(await t4Rev('program'))?.pagesDone}`;
+  const sessBefore = (await t4Source())?.sessionId;
+  const copiesBefore = JSON.stringify(t4v1.body.copies);
+  const stale = (await statusOf()).events.filter(
+    (e: any) => e.tapeId === 'T4' && e.kind === 'stale-write',
+  );
+  check('迟到响应写入被围栏拒绝（记录丢弃事件）', stale.length > 0, `丢弃 ${stale.length} 次`);
+
+  await sleep(500);
+  const progAfter = `${(await t4Rev('program'))?.pagesDone}`;
+  const sessAfter = (await t4Source())?.sessionId;
+  const t4v1After = await getTape('T4');
+  check('迟到响应未推进或回退页进度', progAfter === progBefore, `节目单 ${progBefore}/4 → ${progAfter}/4 页`);
+  check('迟到响应未覆盖会话', sessAfter === sessBefore, `${String(sessBefore).slice(0, 8)}…`);
+  check(
+    '迟到响应未改变生效版次与播放区间/缺口',
+    t4v1After.status === 200 && t4v1After.body.timelineVersion === 1 && JSON.stringify(t4v1After.body.copies) === copiesBefore,
+  );
+
+  // 暂停状态换进程同样生效：暂停期间发布 v2 两侧清单
+  await ctl('/control/pause', { tape: 'T4', durationMs: 4_000 });
+  await ctl('/control/publish', { tape: 'T4', timeline: { version: 2, durationMs: 3_600_000 }, manifest: { kind: 'program', timelineVersion: 2, revision: 1, pageSize: 1, records: T4V2_PROG } });
+  await ctl('/control/publish', { tape: 'T4', manifest: { kind: 'restoration', timelineVersion: 2, revision: 1, pageSize: 2, records: T4V2_REST } });
+  note('已暂停 T4 4 秒并发布 v2 两侧清单（S2 撤下、新增 S5/S6，缺口位置更新）');
+  // 等某个进程真正学到暂停（落库）后，立刻把持租约的 B 挂起
+  const learned = await waitFor('暂停状态落库', async () => !!(await t4Source())?.paused, 5_000);
+  check('暂停状态落入库中（换进程同样生效）', learned);
+  pauseProc(B);
+  const bPausedAt = Date.now();
+  note('已挂起持有 T4 租约的进程 B：暂停状态仍在库中，应由接手进程继续遵守');
+  // 暂停窗口：从落库起，到暂停到期前，任何进程都不得向 T4 发请求
+  const pausedUntil = (await t4Source())?.pausedUntil ?? 0;
+  const windowStart = Date.now();
+  const takeover2 = await waitFor(
+    'A 接手 T4（暂停仍生效）',
+    async () => (await t4Source())?.leaseOwner === 'A',
+    3_000,
+  );
+  check('暂停中接手：租约到期后另一进程接管', takeover2, `耗时 ${Date.now() - bPausedAt}ms`);
+  await sleep(Math.max(0, pausedUntil - Date.now() - 300));
+  const duringPause = await t4ApiReqs(windowStart);
+  const reqsNotBlocked = duringPause.filter((l) => l.route !== 'blocked');
+  check(
+    '暂停窗口内两个进程都没有向 T4 发业务请求',
+    reqsNotBlocked.length === 0,
+    `窗口内业务请求 ${reqsNotBlocked.length} 个${duringPause.length ? `（423 ${duringPause.length} 次）` : ''}`,
+  );
+
+  // 暂停到期后由接手进程按原协议重建会话、采齐 v2 并切换
+  const t4v2 = await waitFor(
+    'T4 v2 生效',
+    async () => {
+      const t = await getTape('T4');
+      return t.status === 200 && t.body.timelineVersion === 2;
+    },
+    20_000,
+  );
+  check('暂停到期后接手进程按原协议重建会话并采齐 v2', t4v2, elapsed());
+  const sessAfterPause = (await t4Source())?.sessionId;
+  check('暂停恢复后发放新会话（与暂停前不同）', !!sessAfterPause && sessAfterPause !== sessAfter, `${String(sessAfter).slice(0, 8)}… → ${String(sessAfterPause).slice(0, 8)}…`);
+  const s6 = await getProg('T4', 'S6');
+  const s2 = await getProg('T4', 'S2');
+  check('v2 生效后播放区间与缺口随新修订更新（S6 可查、S2 撤下）', s6.status === 200 && s2.status === 404);
+  const c1v2 = s6.status === 200 ? s6.body.copies.find((c: any) => c.copyId === 'C1') : null;
+  check(
+    'v2 生效后缺口随新修订更新（C1 缺 41:40–45:00）',
+    !!c1v2 && JSON.stringify(c1v2.missing.map((m: any) => m.master)) === JSON.stringify([[2_500_000, 2_700_000]]),
+    c1v2 ? c1v2.missing.map((m: any) => `${fmtMs(m.master[0])}–${fmtMs(m.master[1])}`).join('、') : '无',
+  );
+  note('双进程接手后的节目定位（T4 / S6）：');
+  printProgramView(s6.body);
+
+  // 核对请求记录：按进程统计 T4 的 API 请求，并列出接管前后的逐条记录
+  const stAll = await ctlGet('/control/state');
+  const t4log = ((stAll.body.sources.T4?.log ?? []) as any[]).filter((l) =>
+    ['session', 'index', 'page-token', 'page', 'blocked'].includes(l.route),
+  );
+  const byOwner = new Map<string, number>();
+  for (const l of t4log) {
+    const k = l.by ?? '-';
+    byOwner.set(k, (byOwner.get(k) ?? 0) + 1);
+  }
+  note('请求记录核对（T4，按采集器进程统计 API 请求数）：');
+  for (const [o, n] of [...byOwner.entries()].sort()) console.log(`    进程 ${o}：${n} 个请求`);
+  const evAll = (await statusOf()).events.filter((e: any) => e.tapeId === 'T4');
+  note('租约事件（接管 / 迟到写入被拒）：');
+  for (const e of evAll.slice().reverse()) {
+    console.log(`    ${new Date(e.t).toISOString().slice(11, 23)} ${e.kind} fence=${e.fence} ${e.detail}`);
+  }
+  note('接管前后的逐条请求（时间 · 进程 · 路由 · 说明）：');
+  const takeT = evTake?.t ?? 0;
+  const nearTake = t4log.filter((l) => Math.abs(l.t - takeT) < 2500);
+  for (const l of nearTake) {
+    console.log(`    ${new Date(l.t).toISOString().slice(11, 23)} ${l.by ?? '-'} ${l.route} ${l.detail}`);
+  }
+
+  // 收尾：恢复正常调度，清掉阶段 7 的受控进程
+  for (const c of [A, B]) { resumeProc(c); killProc(c); }
+  await sleep(200);
+}
+
 // ---------- 主流程 ----------
 async function main(): Promise<void> {
   rmSync(WORK, { recursive: true, force: true });
   mkdirSync(WORK, { recursive: true });
 
-  banner('阶段 0/6 · 启动本地模拟站点与查询接口');
+  banner('阶段 0/8 · 启动本地模拟站点与查询接口');
   startProc('site', 'site.ts', { PORT: String(SITE_PORT) });
   const siteUp = await waitFor('站点启动', async () => (await ctlGet('/control/state')).status === 200, 10_000);
   check('模拟站点启动', siteUp);
@@ -171,7 +397,7 @@ async function main(): Promise<void> {
   const apiUp = await waitFor('查询接口启动', async () => (await httpReq('GET', `${API}/health`)).status === 200, 10_000);
   check('查询接口启动', apiUp);
 
-  banner('阶段 1/6 · 首次采集：响应丢失恢复 · 采不齐不阻塞他盘');
+  banner('阶段 1/8 · 首次采集：响应丢失恢复 · 采不齐不阻塞他盘');
   let syncProc = startProc('sync', 'sync.ts', { SITE_URL: SITE, DB_PATH: DB, POLL_MS: '250' });
   const firstSync = await waitFor(
     'T1/T2 首版采齐生效',
@@ -217,7 +443,7 @@ async function main(): Promise<void> {
     c2a.missing.length === 0 && c2a.playable.some((p: any) => p.master[0] === 1_800_000 && p.copy[1] === 2_200_000),
   );
 
-  banner('阶段 2/6 · 来源暂停：该来源零请求，其他来源继续同步');
+  banner('阶段 2/8 · 来源暂停：该来源零请求，其他来源继续同步');
   const sessBefore = (await getStatus()).body.sources.find((s: any) => s.tapeId === 'T1')?.sessionId;
   const pauseStart = Date.now();
   await ctl('/control/pause', { tape: 'T1', durationMs: 4000 });
@@ -262,7 +488,7 @@ async function main(): Promise<void> {
   const afterLearn = t1log2.filter((l) => blocked && l.t > blocked.t + 50 && l.t < pauseStart + 3900);
   check('得知暂停后未再向 T1 发任何请求', afterLearn.length === 0, `登记暂停后窗口内请求 ${afterLearn.length} 个`);
 
-  banner('阶段 3/6 · 恢复后新会话 · 同版次修订原子切换');
+  banner('阶段 3/8 · 恢复后新会话 · 同版次修订原子切换');
   check('恢复后 T1 节目单 rev2 采齐生效', sawNew, elapsed());
   check('修订切换原子性：查询结果要么全旧要么全新', sawOld && !sawMixed, `旧 ${sawOld ? '见过' : '未见过'} / 混合 ${sawMixed ? '出现过!' : '未出现'}`);
   const sessAfter = (await getStatus()).body.sources.find((s: any) => s.tapeId === 'T1')?.sessionId;
@@ -279,7 +505,7 @@ async function main(): Promise<void> {
       c1b.playable.some((p: any) => p.master[0] === 1_500_000 && p.master[1] === 2_400_000),
   );
 
-  banner('阶段 4/6 · 新时间轴版次 v2 生效 · 旧记录随修订撤下');
+  banner('阶段 4/8 · 新时间轴版次 v2 生效 · 旧记录随修订撤下');
   await ctl('/control/publish', { tape: 'T1', timeline: { version: 2, durationMs: 3_900_000 }, manifest: { kind: 'program', timelineVersion: 2, revision: 1, pageSize: 2, records: T1V2_PROG } });
   await ctl('/control/publish', { tape: 'T1', manifest: { kind: 'restoration', timelineVersion: 2, revision: 1, pageSize: 2, records: T1V2_REST } });
   note('已发布 T1 时间轴 v2：节目单 rev1（P3 移除、新增 P4）+ 修复清单 rev1（损坏位置变化）');
@@ -303,7 +529,7 @@ async function main(): Promise<void> {
     JSON.stringify(c1p4.missing.map((m: any) => m.master)) === JSON.stringify([[3_000_000, 3_300_000]]),
   );
 
-  banner('阶段 5/6 · 采集器重启：原有修订已撤下 · 已采齐复用');
+  banner('阶段 5/8 · 采集器重启：原有修订已撤下 · 已采齐复用');
   await ctl('/control/withdraw', { tape: 'T1', kind: 'program', timelineVersion: 1, revision: 1 });
   await ctl('/control/withdraw', { tape: 'T1', kind: 'program', timelineVersion: 1, revision: 2 });
   await ctl('/control/withdraw', { tape: 'T1', kind: 'restoration', timelineVersion: 1, revision: 1 });
@@ -329,7 +555,7 @@ async function main(): Promise<void> {
   const pageReqsAfter = (await ctlGet('/control/state')).body.sources.T1.log.filter((l: any) => l.route === 'page').length;
   check('已采齐的修订可复用，未重复抓取', pageReqsAfter === pageReqsBefore, `T1 页面请求 ${pageReqsBefore} → ${pageReqsAfter} 次`);
 
-  banner('阶段 6/6 · 节目定位结果展示');
+  banner('阶段 6/8 · 节目定位结果展示');
   note('按母带查询（GET /tapes/T1）：');
   printTapeView((await getTape('T1')).body);
   note('按节目跨库查询（GET /programs/R2 → T3）：');
@@ -346,6 +572,8 @@ async function main(): Promise<void> {
         `：${r.status} ${r.pagesDone}/${r.pageCount} 页${r.listed ? '' : '（站点已撤下）'}${dmg}`,
     );
   }
+
+  await runDualProcessScenario();
 
   banner('验证结果');
   console.log(`  ${passed} 项通过，${failed} 项失败 · 总耗时 ${elapsed()}`);

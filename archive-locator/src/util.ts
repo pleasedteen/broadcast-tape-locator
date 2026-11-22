@@ -18,11 +18,19 @@ export interface HttpResult {
 }
 
 /** 简单 JSON HTTP 客户端；网络异常归一为 status=0，便于采集器统一走"响应丢失"恢复路径 */
-export async function httpReq(method: string, url: string, body?: unknown, timeoutMs = 3000): Promise<HttpResult> {
+export async function httpReq(
+  method: string,
+  url: string,
+  body?: unknown,
+  timeoutMs = 3000,
+  headers?: Record<string, string>,
+): Promise<HttpResult> {
   try {
+    const hs: Record<string, string> = { ...(headers ?? {}) };
+    if (body !== undefined) hs['content-type'] = 'application/json';
     const res = await fetch(url, {
       method,
-      headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+      headers: hs,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });

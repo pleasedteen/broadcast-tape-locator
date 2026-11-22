@@ -11,7 +11,7 @@
 | 模拟站点 | `npm run site` | 本地模拟清单站点（不依赖真实外站），端口 4181 |
 | 同步入口 | `npm run sync` | 采集器守护进程，断点续采、暂停避让、令牌恢复 |
 | 查询接口 | `npm run api` | 只读查询服务，端口 4182，独立于采集器进程 |
-| 一键验证 | `npm run verify` | 自动起停全部组件，约 7 秒（远低于 80 秒）跑完 6 阶段 24 项检查 |
+| 一键验证 | `npm run verify` | 自动起停全部组件，约 30 秒（远低于 80 秒）跑完 7 阶段 41 项检查 |
 
 ## 快速开始
 
@@ -31,7 +31,29 @@ DB_PATH=./data/archive.db PORT=4182 \
   npm run api                             # 查询接口 http://127.0.0.1:4182
 ```
 
-环境变量：`PORT`（site/api 端口）、`SITE_URL`、`DB_PATH`、`POLL_MS`（采集轮询间隔）。
+环境变量：`PORT`（site/api 端口）、`SITE_URL`、`DB_PATH`、`POLL_MS`（采集轮询间隔）、
+`SYNC_OWNER`（进程标识）、`LEASE_TTL_MS`（采集租约有效期，默认 800）、
+`SYNC_TAPES`（只处理这些来源，逗号分隔；用于多进程分工）。
+
+### 多进程共用同一个库
+
+采集器可以同时起多个进程、共用同一个 SQLite 库：
+
+```bash
+SITE_URL=http://127.0.0.1:4181 DB_PATH=./data/archive.db SYNC_OWNER=A npm run sync &
+SITE_URL=http://127.0.0.1:4181 DB_PATH=./data/archive.db SYNC_OWNER=B npm run sync &
+```
+
+- **不同来源可并行**：各来源的租约互相独立，不同进程可同时采集不同来源。
+- **同一来源只有一个进程发请求**：`sources.lease_*` 上的按来源租约（带单调递增 fence）保证互斥；
+  两进程对同一来源竞争时只有一个能拿到租约，另一个本轮直接跳过。
+- **挂起后 2 秒内接手**：持租约进程被挂起（如 SIGSTOP）后心跳停止续约，租约（默认 800ms）
+  到期，另一进程在下一轮接管并抬高 fence，从首个未入库页继续。
+- **迟到响应被丢弃**：旧进程恢复后仍以旧 fence 写入，所有写操作都在围栏事务内校验
+  `owner + fence + 未过期`；不满足则整体拒绝——既不推进也不回退页进度，也不覆盖会话，
+  生效版次与播放区间/缺口保持不变。事件记入 `sync_events`，可在 `GET /sync/status` 查看。
+- **暂停换进程同样生效**：`paused_until` 落在库里，任一进程看到都不会发请求；
+  到期后由当时持租约的进程按原协议重建会话继续。
 
 ## 领域模型
 
@@ -54,7 +76,7 @@ DB_PATH=./data/archive.db PORT=4182 \
 | `GET /tapes/:tape/programs` | 当前生效节目单 |
 | `GET /tapes/:tape/programs/:pid` | 节目视图：母带范围 + 各副本可播放时间段 + 缺失区段 |
 | `GET /programs/:pid` | 按节目跨母带查询 |
-| `GET /sync/status` | 同步进度：各来源会话/暂停状态、每修订进度（已采/总页数）、待补齐清单已采到的损坏记录位置 |
+| `GET /sync/status` | 同步进度：各来源会话/暂停/租约状态、每修订进度（已采/总页数）、待补齐清单已采到的损坏记录位置、跨进程租约事件 |
 | `GET /health` | 存活检查 |
 
 响应示例（`GET /tapes/T1/programs/P2`，时间为毫秒）：
@@ -86,7 +108,9 @@ DB_PATH=./data/archive.db PORT=4182 \
   需重新申请令牌续采。页面有 `table` / `cards` 两种排版，按页交替。
 
 演示控制接口：`POST /control/publish`（发布修订）、`/control/pause`（暂停来源，恢复后旧会话作废、发放新会话）、
-`/control/withdraw`、`/control/withdraw-after`、`/control/lose-response`、`/control/rotate-token`、`GET /control/state`。
+`/control/withdraw`、`/control/withdraw-after`、`/control/lose-response`、`/control/rotate-token`、
+`/control/delay`（取页响应人为延迟，用于制造挂起/接管窗口）、`/control/add-source`（新增来源）、`GET /control/state`
+（含每个请求的发起进程 `by`，便于核对多进程请求记录）。
 
 ## 同步与恢复语义
 
@@ -108,5 +132,17 @@ DB_PATH=./data/archive.db PORT=4182 \
 5. **采集器重启**：SIGKILL 后站点已撤下 T1 全部 v1 修订；重启对账后已采齐修订保留复用、
    不重复抓取，T3 补齐后生效；重启窗口内查询结果不变。
 6. **节目定位展示**：按母带/按节目输出可播放时间段（含 1.5x 变速段换算）与缺失母带区段。
+7. **双进程共库**：两个采集器进程共用同一库；SIGSTOP 挂起持租约的进程后，另一进程 2 秒内接手
+   并从首个未入库页续采；恢复旧进程，其迟到响应被围栏丢弃（进度不回退/不推进、会话不被覆盖、
+   生效版次与播放区间不变）；暂停状态换进程后同样生效，到期按原协议重建会话；最后按进程核对
+   请求记录并输出定位结果。
 
 数据文件：`data/archive.db`（手动运行）、`.verify/`（验证用，每次运行前清空）。
+
+## 多进程一致性设计要点
+
+- 只有 `sources` 表被多进程并发写（进度、页记录、生效指针都只由「当时持租约的进程」写）；
+  查询接口只读，天然无冲突。
+- 租约用单事务 `BEGIN IMMEDIATE` 判定与接管，避免两个进程同时接管同一来源。
+- 写入围栏把「校验租约」与「写入/进度推进/生效切换」放在同一事务里，迟到响应无法留下半截写入。
+- 页入库还校验「页码 = 当前首个未入库页」，防止乱序推进；页级幂等由 `pages` 主键兜底。
