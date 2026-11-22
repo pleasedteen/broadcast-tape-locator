@@ -1,6 +1,9 @@
 /**
  * 本地模拟站点（不依赖真实外站）。
  *
+ * 同一套代码用 REPLICA_ID 区分主备两个进程（A=主站 4181 / B=备站 4183），
+ * 两站会话、签名令牌、暂停状态、翻页令牌完全独立（各自内存态、各自进程）。
+ *
  * 模拟的站点行为：
  * - 页面有两种排版：table（扁平行）与 cards（嵌套卡片），按页交替。
  * - 翻页签名 = sha256(签名令牌 | 会话 | 翻页令牌)，随站点刚发出的签名令牌和当前会话变化；
@@ -8,14 +11,18 @@
  * - 翻页令牌一次性：每次取页先申请；响应可能丢失而令牌已消费（站点直接断开连接），
  *   客户端需重新申请令牌续采。
  * - 站点可要求暂停某一来源：暂停期间该来源一切请求返回 423；恢复后旧会话作废，发放新会话。
+ *   主备两站的暂停互不影响——只暂停本站，另一站照常服务（用于验证独立暂停与接力）。
  * - 修订可被撤下：撤下后从索引消失，取页返回 410。
- * - /control/* 为演示控制接口（发布修订、暂停、撤下、丢响应、查看站点日志）。
+ * - 索引给出每份清单的整单内容哈希与页大小：同号清单两站内容一致则哈希相同；
+ *   页大小可按站覆盖，制造「两站分页不同」；时长可按站改写，制造时长冲突。
+ * - /control/* 为演示控制接口（发布修订、暂停、撤下、丢响应、分页覆盖、查看站点日志）。
  */
 import http from 'node:http';
-import { randomToken, sha256 } from './util.ts';
+import { canonicalHash, randomToken, sha256 } from './util.ts';
 import type { ManifestSeed, Rec } from './types.ts';
 
 const PORT = Number(process.env.PORT ?? 4181);
+const REPLICA = process.env.REPLICA_ID ?? 'A';
 
 interface PageTokenRec {
   id: string;
@@ -32,6 +39,7 @@ interface Manifest extends ManifestSeed {
   listed: boolean;
   withdrawAfterPage: number | null;
   losePages: Map<number, number>; // page -> 剩余丢响应次数
+  pageSizeOverride: number | null; // 本站分页大小覆盖（制造主备分页不同）
 }
 interface LogEntry {
   t: number;
@@ -44,6 +52,7 @@ interface Source {
   epoch: number; // 每次暂停 +1，使旧会话失效
   sessions: Map<string, Session>;
   timelines: Map<number, number>; // 时间轴版次 -> 时长 ms
+  timelineOverrides: Map<number, number>; // 本站时长覆盖（制造主备时长冲突）
   manifests: Map<string, Manifest>;
   log: LogEntry[];
 }
@@ -54,14 +63,15 @@ const state = {
 };
 
 const keyOf = (kind: string, v: number, r: number) => `${kind}:${v}:${r}`;
-const pageCountOf = (m: Manifest) => Math.max(1, Math.ceil(m.records.length / m.pageSize));
+const effPageSize = (m: Manifest) => m.pageSizeOverride ?? m.pageSize;
+const pageCountOf = (m: Manifest) => Math.max(1, Math.ceil(m.records.length / effPageSize(m)));
 
 function slog(src: Source | null, route: string, detail: string): void {
   if (src) {
     src.log.push({ t: Date.now(), route, detail });
     if (src.log.length > 500) src.log.shift();
   }
-  console.log(`[site] ${src?.tapeId ?? '-'} ${route} ${detail}`);
+  console.log(`[site ${REPLICA}] ${src?.tapeId ?? '-'} ${route} ${detail}`);
 }
 
 function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
@@ -71,6 +81,7 @@ function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
     epoch: 1,
     sessions: new Map(),
     timelines: new Map(timelines),
+    timelineOverrides: new Map(),
     manifests: new Map(),
     log: [],
   };
@@ -79,13 +90,14 @@ function addSource(tapeId: string, timelines: Array<[number, number]>): Source {
 }
 
 function addManifest(tapeId: string, seed: ManifestSeed): void {
-  const src = state.sources.get(tapeId);
-  if (!src) throw new Error(`未知母带 ${tapeId}`);
+  let src = state.sources.get(tapeId);
+  if (!src) src = addSource(tapeId, []); // 控制接口可向本站单独发布新母带
   src.manifests.set(keyOf(seed.kind, seed.timelineVersion, seed.revision), {
     ...seed,
     listed: true,
     withdrawAfterPage: null,
     losePages: new Map(),
+    pageSizeOverride: null,
   });
 }
 
@@ -145,6 +157,30 @@ function seed(): void {
       { type: 'segment', copyId: 'C1', masterStartMs: 450_000, masterEndMs: 900_000, copyStartMs: 430_000, rate: 1 },
     ],
   });
+  // T4：45 分钟母带，主备接力演示带。7 条节目 + 4 条修复记录，
+  // 主站页大小 3、备站页大小 1（由验证脚本通过 /control/page-size 制造差异）。
+  addSource('T4', [[1, 2_700_000]]);
+  addManifest('T4', {
+    kind: 'program', timelineVersion: 1, revision: 1, pageSize: 3,
+    records: [
+      { type: 'program', programId: 'S1', title: '开播曲', startMs: 0, endMs: 180_000 },
+      { type: 'program', programId: 'S2', title: '早间新闻', startMs: 180_000, endMs: 720_000 },
+      { type: 'program', programId: 'S3', title: '气象服务', startMs: 720_000, endMs: 900_000 },
+      { type: 'program', programId: 'S4', title: '长篇评书', startMs: 900_000, endMs: 1_800_000 },
+      { type: 'program', programId: 'S5', title: '广告时段', startMs: 1_800_000, endMs: 1_980_000 },
+      { type: 'program', programId: 'S6', title: '听众点歌', startMs: 1_980_000, endMs: 2_400_000 },
+      { type: 'program', programId: 'S7', title: '收台曲', startMs: 2_400_000, endMs: 2_700_000 },
+    ],
+  });
+  addManifest('T4', {
+    kind: 'restoration', timelineVersion: 1, revision: 1, pageSize: 3,
+    records: [
+      { type: 'segment', copyId: 'C1', masterStartMs: 0, masterEndMs: 1_200_000, copyStartMs: 0, rate: 1 },
+      { type: 'damage', copyId: 'C1', masterStartMs: 1_200_000, masterEndMs: 1_320_000, note: '带基粘连' },
+      { type: 'segment', copyId: 'C1', masterStartMs: 1_320_000, masterEndMs: 2_700_000, copyStartMs: 1_200_000, rate: 1 },
+      { type: 'segment', copyId: 'C2', masterStartMs: 0, masterEndMs: 2_700_000, copyStartMs: 0, rate: 1 },
+    ],
+  });
 }
 
 // ---------- 两种排版 ----------
@@ -159,7 +195,8 @@ function recToCard(rec: Rec): any {
   return { kind: 'damage', damage: { copy: rec.copyId, master: { startMs: rec.masterStartMs, endMs: rec.masterEndMs }, note: rec.note } };
 }
 function renderPage(m: Manifest, page: number, layout: 'table' | 'cards'): any {
-  const recs = m.records.slice(page * m.pageSize, (page + 1) * m.pageSize);
+  const size = effPageSize(m);
+  const recs = m.records.slice(page * size, (page + 1) * size);
   if (layout === 'table') return { layout, pageNo: page, pageCount: pageCountOf(m), rows: recs.map(recToRow) };
   return { layout, page: { index: page, count: pageCountOf(m) }, items: recs.map(recToCard) };
 }
@@ -228,7 +265,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     const sess: Session = { id: randomToken(), epoch: src.epoch, tokens: new Map() };
     src.sessions.set(sess.id, sess);
     slog(src, 'session', `发放新会话 ${sess.id}（签名令牌轮换为 ${state.signToken.slice(0, 8)}…）`);
-    send(res, 200, { sessionId: sess.id, signToken: state.signToken });
+    send(res, 200, { replicaId: REPLICA, sessionId: sess.id, signToken: state.signToken });
     return;
   }
 
@@ -240,16 +277,23 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   if (route === 'index' && req.method === 'GET') {
     slog(src, 'index', '拉取索引');
     send(res, 200, {
+      replicaId: REPLICA,
       signToken: state.signToken,
-      timelines: [...src.timelines.entries()].map(([version, durationMs]) => ({ version, durationMs })),
+      timelines: [...src.timelines.entries()].map(([version, base]) => ({
+        version,
+        durationMs: src.timelineOverrides.get(version) ?? base,
+      })),
       manifests: [...src.manifests.values()]
         .filter((x) => x.listed)
         .map((x) => ({
           kind: x.kind,
           timelineVersion: x.timelineVersion,
           revision: x.revision,
+          pageSize: effPageSize(x),
           pageCount: pageCountOf(x),
           recordCount: x.records.length,
+          // 整单内容哈希：同号清单两站内容一致时哈希相同（仅取决于记录内容，与排版/分页无关）
+          contentHash: canonicalHash(x.records),
         })),
     });
     return;
@@ -266,8 +310,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     if (typeof body.page !== 'number' || body.page < 0 || body.page >= pageCountOf(mf)) {
       send(res, 416, { error: 'NO_SUCH_PAGE' });
       return;
-    }
-    const tk: PageTokenRec = { id: randomToken(), key, page: body.page, consumed: false };
+    }    const tk: PageTokenRec = { id: randomToken(), key, page: body.page, consumed: false };
     sess.tokens.set(tk.id, tk);
     slog(src, 'page-token', `${key} 第${body.page + 1}页 签发翻页令牌 ${tk.id.slice(0, 8)}…`);
     send(res, 200, { pageToken: tk.id, signToken: state.signToken });
@@ -330,16 +373,17 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
     const sources: any = {};
     for (const [id, s] of state.sources) {
       sources[id] = {
+        replicaId: REPLICA,
         pausedUntil: s.pausedUntil,
         epoch: s.epoch,
         sessions: [...s.sessions.keys()],
         manifests: [...s.manifests.entries()].map(([key, x]) => ({
-          key, listed: x.listed, pageCount: pageCountOf(x), recordCount: x.records.length,
+          key, listed: x.listed, pageSize: effPageSize(x), pageCount: pageCountOf(x), recordCount: x.records.length,
         })),
         log: s.log,
       };
     }
-    send(res, 200, { signToken: state.signToken, sources });
+    send(res, 200, { replicaId: REPLICA, signToken: state.signToken, sources });
     return;
   }
   if (path === '/control/pause' && req.method === 'POST') {
@@ -377,12 +421,30 @@ async function handleControl(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
   if (path === '/control/publish' && req.method === 'POST') {
-    const src = state.sources.get(body.tape);
-    if (!src) return send(res, 404, { error: 'UNKNOWN_TAPE' });
+    const src = state.sources.get(body.tape) ?? addSource(body.tape, []);
     if (body.timeline) src.timelines.set(Number(body.timeline.version), Number(body.timeline.durationMs));
     const mf = body.manifest as ManifestSeed;
     addManifest(body.tape, mf);
     slog(src, 'publish', `${mf.kind} v${mf.timelineVersion} rev${mf.revision} 已发布（${mf.records.length} 条记录）`);
+    send(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/control/page-size' && req.method === 'POST') {
+    // 仅本站分页大小覆盖：主备两站对同一清单分页不同，接力时只能按本站页号续采
+    const src = state.sources.get(body.tape);
+    const mf = src?.manifests.get(keyOf(body.kind, body.timelineVersion, body.revision));
+    if (!src || !mf) return send(res, 404, { error: 'UNKNOWN_MANIFEST' });
+    mf.pageSizeOverride = Number(body.pageSize);
+    slog(src, 'page-size', `${keyOf(body.kind, body.timelineVersion, body.revision)} 本站页大小改为 ${body.pageSize}（${pageCountOf(mf)} 页）`);
+    send(res, 200, { ok: true, pageCount: pageCountOf(mf) });
+    return;
+  }
+  if (path === '/control/timeline-duration' && req.method === 'POST') {
+    // 仅本站时长覆盖：制造主备同版次时长冲突（采集器只标记冲突，不改变基准时长与定位）
+    const src = state.sources.get(body.tape);
+    if (!src) return send(res, 404, { error: 'UNKNOWN_TAPE' });
+    src.timelineOverrides.set(Number(body.timelineVersion), Number(body.durationMs));
+    slog(src, 'timeline', `时间轴 v${body.timelineVersion} 本站时长改为 ${body.durationMs}ms（与主站冲突）`);
     send(res, 200, { ok: true });
     return;
   }
@@ -404,5 +466,5 @@ const server = http.createServer((req, res) => {
   });
 });
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[site] 模拟站点已启动: http://127.0.0.1:${PORT}（来源: ${[...state.sources.keys()].join(', ')}）`);
+  console.log(`[site ${REPLICA}] 模拟站点已启动: http://127.0.0.1:${PORT}（站点标识 ${REPLICA}，来源: ${[...state.sources.keys()].join(', ')}）`);
 });

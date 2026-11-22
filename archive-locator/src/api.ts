@@ -123,30 +123,67 @@ function programView(tape: string, pid: string): { status: number; body: any } {
 function syncStatus(): any {
   const sources = (db.prepare('SELECT * FROM sources ORDER BY tape_id').all() as any[]).map((s) => ({
     tapeId: s.tape_id,
-    pausedUntil: s.paused_until,
-    sessionId: s.session_id,
+    activeReplica: s.active_replica ?? 'A',
+    lastReplica: s.last_replica ?? s.active_replica ?? 'A',
+    replicas: {
+      A: {
+        pausedUntil: s.paused_until,
+        sessionId: s.session_id,
+      },
+      B: {
+        pausedUntil: s.paused_until_b,
+        sessionId: s.session_id_b,
+      },
+    },
   }));
-  const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, kind, revision').all() as any[]).map((r) => ({
-    tapeId: r.tape_id,
-    kind: r.kind,
-    timelineVersion: r.timeline_version,
-    revision: r.revision,
-    status: r.status,
-    pagesDone: r.pages_done,
-    pageCount: r.page_count,
-    listed: !!r.listed,
-    // 待补齐清单已采到的损坏记录位置
-    damages: (db.prepare('SELECT * FROM damages WHERE revision_id = ?').all(r.id) as any[]).map((d) => ({
-      copyId: d.copy_id,
-      masterRange: [d.master_start_ms, d.master_end_ms],
-      note: d.note,
-    })),
+  const revisions = (db.prepare('SELECT * FROM revisions ORDER BY tape_id, timeline_version, kind, revision').all() as any[]).map((r) => {
+    const replicaRows = db.prepare('SELECT * FROM replica_meta WHERE revision_id = ? ORDER BY replica').all(r.id) as any[];
+    const replicaPages = new Map<string, number>();
+    for (const rp of db.prepare('SELECT replica, COUNT(*) AS n FROM replica_pages WHERE revision_id = ? GROUP BY replica').all(r.id) as any[]) {
+      replicaPages.set(rp.replica, rp.n);
+    }
+    return {
+      tapeId: r.tape_id,
+      kind: r.kind,
+      timelineVersion: r.timeline_version,
+      revision: r.revision,
+      status: r.status,
+      pagesDone: r.pages_done,
+      pageCount: r.page_count,
+      recordsDone: r.records_done,
+      recordCount: r.record_count,
+      listed: !!r.listed,
+      conflict: !!r.conflict,
+      // 各站独立视图：在架/分页/哈希冲突/本站已取页（接力时只取含未采记录的页）
+      replicas: replicaRows.map((m) => ({
+        replica: m.replica,
+        listed: !!m.listed,
+        pageSize: m.page_size,
+        pageCount: m.page_count,
+        recordCount: m.record_count,
+        pagesFetched: replicaPages.get(m.replica) ?? 0,
+        contentHash: m.content_hash,
+        conflict: !!m.conflict,
+      })),
+      // 待补齐清单已采到的损坏记录位置
+      damages: (db.prepare('SELECT * FROM damages WHERE revision_id = ?').all(r.id) as any[]).map((d) => ({
+        copyId: d.copy_id,
+        masterRange: [d.master_start_ms, d.master_end_ms],
+        note: d.note,
+      })),
+    };
+  });
+  const timelines = (db.prepare('SELECT * FROM timelines ORDER BY tape_id, timeline_version').all() as any[]).map((t) => ({
+    tapeId: t.tape_id,
+    timelineVersion: t.timeline_version,
+    durationMs: t.duration_ms,
+    conflict: !!t.conflict,
   }));
   const activations = (db.prepare('SELECT * FROM activations ORDER BY tape_id').all() as any[]).map((a) => ({
     tapeId: a.tape_id,
     timelineVersion: a.timeline_version,
   }));
-  return { sources, revisions, activations };
+  return { sources, revisions, timelines, activations };
 }
 
 const HELP = {

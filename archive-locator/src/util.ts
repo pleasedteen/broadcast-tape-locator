@@ -4,6 +4,23 @@ export function sha256(s: string): string {
   return crypto.createHash('sha256').update(s).digest('hex');
 }
 
+/** 规范化 JSON（对象键排序），使同内容记录在两个站点上算出一致哈希 */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    return `{${Object.keys(v as Record<string, unknown>)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/** 清单/记录内容哈希：两个站点对同一份清单必须算出相同值，不同内容立即现形 */
+export function canonicalHash(obj: unknown): string {
+  return sha256(canonical(obj));
+}
+
 export function randomToken(): string {
   return crypto.randomBytes(8).toString('hex');
 }
