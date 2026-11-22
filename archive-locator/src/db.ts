@@ -11,6 +11,7 @@
  *   生效切换在单个事务内完成，查询按指针一次读出，保证播放位置与缺失区段同生同灭。
  */
 import { DatabaseSync } from 'node:sqlite';
+import { statSync } from 'node:fs';
 
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
@@ -18,6 +19,85 @@ export function openDb(path: string): DatabaseSync {
   db.exec('PRAGMA busy_timeout = 5000');
   migrate(db);
   return db;
+}
+
+/**
+ * 只读查询会话（查询接口专用）。
+ *
+ * 本环境是 virtiofs 挂载。两条约束同时成立：
+ *  1) 不能每请求开/关连接——查询进程会反复成为「最后连接」，使 -wal/-shm 被删除重建，
+ *     并发的写进程会收到 SIGBUS。因此保留一条长期连接。
+ *  2) 长期连接会冻结在旧快照——别处（采集器被 SIGKILL/交接）删除并重建 -wal 后，旧连接
+ *     仍指向已删除的 inode。因此在每次查询前比对 -wal 的 inode；一旦变化就立刻重开。
+ *
+ * 重开采用「先开新连接、再关旧连接」，任何瞬间都至少持有一条连接；读取前后再各比对一次
+ * inode，读取期间恰好被替换则自动重试，尽量缩小「刚被替换」的窗口。
+ */
+export class ReadSession {
+  private db: DatabaseSync | null = null;
+  private walIno: number | null = null;
+  readonly path: string;
+
+  constructor(path: string) {
+    this.path = path;
+  }
+
+  private static walInode(path: string): number | null {
+    try { return statSync(`${path}-wal`).ino; } catch { return null; }
+  }
+
+  /** 重开若 -wal inode 变化；返回后保证 self.walIno 与磁盘一致 */
+  private refresh(): DatabaseSync {
+    const now = ReadSession.walInode(this.path);
+    if (this.db === null) {
+      this.db = openDb(this.path);
+      this.walIno = ReadSession.walInode(this.path);
+      return this.db;
+    }
+    if (now !== this.walIno) {
+      // 先开新连接、再关旧连接：任何瞬间都至少持有一条连接，避免本进程成为「最后连接」
+      // 而触发 -wal/-shm 被删除重建（会使并发写进程 mmap 访问时收到 SIGBUS）。
+      const fresh = openDb(this.path);
+      const old = this.db;
+      this.db = fresh;
+      this.walIno = ReadSession.walInode(this.path);
+      try { old.close(); } catch { /* ignore */ }
+    } else {
+      this.walIno = now;
+    }
+    return this.db;
+  }
+
+  /**
+   * 单次请求：单个只读事务内完成整次查询，保证一致快照。
+   * 若读取期间 -wal 恰好被替换（说明读到的可能是旧文件），自动重试一次。
+   */
+  read<T>(fn: (db: DatabaseSync) => T): T {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const db = this.refresh();
+      const before = this.walIno;
+      db.exec('BEGIN');
+      try {
+        const out = fn(db);
+        db.exec('COMMIT');
+        if (ReadSession.walInode(this.path) === before) return out;
+      } catch (e) {
+        try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+        throw e;
+      }
+    }
+    // 三次都赶上文件替换：退回最后一次读取结果（极少见）
+    const db = this.refresh();
+    db.exec('BEGIN');
+    try {
+      const out = fn(db);
+      db.exec('COMMIT');
+      return out;
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+      throw e;
+    }
+  }
 }
 
 function migrate(db: DatabaseSync): void {
@@ -82,6 +162,16 @@ function migrate(db: DatabaseSync): void {
       program_revision_id INTEGER NOT NULL,
       restoration_revision_id INTEGER NOT NULL,
       activated_at INTEGER NOT NULL
+    );
+    -- 采集租约：同一来源同一时刻只允许一路采集。
+    -- fence 单调递增，进程重启/被接管后旧持有者的写入会因 fence 不符被拒（迟到响应隔离）。
+    CREATE TABLE IF NOT EXISTS sync_leases (
+      tape_id TEXT PRIMARY KEY,
+      holder TEXT NOT NULL,
+      fence INTEGER NOT NULL,
+      acquired_at INTEGER NOT NULL,
+      renewed_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
     );
   `);
 }

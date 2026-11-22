@@ -9,9 +9,22 @@
  * - 翻页令牌一次性；响应丢失（连接被断开）后重新申请令牌续采，不重复消费。
  * - 来源暂停：423 后记录 paused_until，期间不向该来源发任何请求；恢复后重建会话。
  * - 生效切换：某修订采齐的同一事务内重算生效指针，查询侧原子看到新旧结果。
+ * - 多进程交接：同一来源的采集权由 sync_leases 租约保护（TTL 默认 2.5s，远小于 5s）。
+ *   持有者每个轮询周期续租；进程卡住（存活但不再续租）时租约自然到期，另一进程按已落库
+ *   进度接管并拿到更大的 fence。此后旧进程的所有写入都因 fence 不符被拒——恢复后的迟到
+ *   响应不能改变会话、采集进度或生效指针。
  */
 import type { DatabaseSync } from 'node:sqlite';
-import { openDb, recomputeActivation, withTx } from './db.ts';
+import { openDb, recomputeActivation } from './db.ts';
+import {
+  makeHolderId,
+  recomputeOnAcquire,
+  releaseLease,
+  renewLease,
+  tryAcquire,
+  withFencedTx,
+  type LeaseCtx,
+} from './lease.ts';
 import { httpReq, sha256, sleep } from './util.ts';
 import type { Rec } from './types.ts';
 
@@ -19,19 +32,43 @@ export interface CollectorOpts {
   siteUrl: string;
   dbPath: string;
   pollMs: number;
+  /** 租约 TTL（毫秒）；须小于 5000 才能满足「5 秒内接管」 */
+  leaseTtlMs?: number;
+  /** 进程标识（默认自动生成）；验证脚本用它区分 A/B 两路采集 */
+  holderId?: string;
+  /** 等待另一进程租约时的静默提示节流 */
+  onWait?: (tape: string) => void;
+  /**
+   * 自检/演示用：某页响应已到达、落库前调用（可在此阻塞事件循环，模拟「卡住但仍存活」）。
+   * 阻塞期间进程仍存活，但不再续租；恢复后该页的迟到写入应被围栏拒绝。
+   */
+  stallBeforeStore?: (info: StallInfo) => void;
 }
 
 type Log = (msg: string) => void;
 
+export interface StallInfo {
+  tape: string;
+  kind: string;
+  timelineVersion: number;
+  revision: number;
+  pageNo: number;
+}
+
+/** 表示本进程已失去某来源的租约（被接管），应立即停止一切写入并退出 */
+class SupersededError extends Error {
+  constructor(tape: string) {
+    super(`${tape}: 租约已被其他采集进程接管`);
+  }
+}
+
 export async function runCollector(opts: CollectorOpts): Promise<void> {
   const db = openDb(opts.dbPath);
-  const log: Log = (m) => console.log(`[sync] ${m}`);
-
-  // 启动即对本地已有数据重算生效指针（覆盖上次退出前未完成的切换）
-  for (const row of db.prepare('SELECT tape_id AS t FROM sources').all() as any[]) {
-    const a = recomputeActivation(db, row.t);
-    if (a.changed) log(`${row.t}: 生效版本 → 时间轴 v${a.timelineVersion}（节目单 rev${a.programRev} + 修复清单 rev${a.restorationRev}）`);
-  }
+  const holder = opts.holderId ?? makeHolderId();
+  const ttl = opts.leaseTtlMs ?? 2500;
+  const log: Log = (m) => console.log(`[sync ${holder}] ${m}`);
+  const owned = new Map<string, number>();
+  log(`进程 ${holder} 启动（租约 TTL ${ttl}ms）`);
 
   let running = true;
   process.on('SIGTERM', () => { running = false; });
@@ -45,47 +82,116 @@ export async function runCollector(opts: CollectorOpts): Promise<void> {
       continue;
     }
     for (const tape of lst.body.tapes as string[]) {
+      if (!running) break;
+      let ctx: LeaseCtx | null;
       try {
-        await syncSource(db, opts.siteUrl, tape, log);
+        ctx = tryAcquire(db, tape, holder, ttl);
       } catch (e) {
+        log(`${tape}: 获取租约异常 ${e}`);
+        await sleep(opts.pollMs);
+        continue;
+      }
+      if (!ctx) {
+        if (owned.has(tape)) {
+          log(`${tape}: 发现其他进程已接管（fence 已推进），本进程停止`);
+          running = false;
+          break;
+        }
+        opts.onWait?.(tape);
+        continue;
+      }
+      const prev = owned.get(tape);
+      owned.set(tape, ctx.fence);
+      if (prev !== ctx.fence) {
+        // 首次取得或从过期租约接管：按已落库数据重算生效指针（不依赖上一位持有者的内存状态）
+        const a = recomputeOnAcquire(db, ctx, ttl);
+        if (!a) throw new SupersededError(tape);
+        if (prev === undefined) {
+          log(`${tape}: 取得采集租约（fence ${ctx.fence}）`);
+        } else {
+          log(`${tape}: 接管采集租约（fence ${prev} → ${ctx.fence}），按已落库进度续采`);
+        }
+        if (a.changed) {
+          log(`${tape}: 生效版本 → 时间轴 v${a.timelineVersion}（节目单 rev${a.programRev} + 修复清单 rev${a.restorationRev}）`);
+        }
+      }
+      try {
+        await syncSource(db, ctx, opts, ttl, log);
+      } catch (e) {
+        if (e instanceof SupersededError) {
+          log(`${tape}: ${e.message}；丢弃迟到响应并退出，避免改变会话/进度/生效结果`);
+          running = false;
+          break;
+        }
         log(`${tape}: 异常 ${e}`);
       }
     }
     await sleep(opts.pollMs);
   }
+
+  // 退出前主动让出租约，便于另一进程立即接管（不必等 TTL 到期）
+  for (const [tape, fence] of owned) {
+    try { releaseLease(db, { tape, holder, fence }); } catch { /* ignore */ }
+  }
   log('采集器退出');
 }
 
-async function syncSource(db: DatabaseSync, site: string, tape: string, log: Log): Promise<void> {
-  db.prepare('INSERT OR IGNORE INTO sources (tape_id) VALUES (?)').run(tape);
+/** 围栏写入：租约已失效时抛 SupersededError，调用方须丢弃本次结果 */
+function mustApply<T>(res: { ok: boolean; value?: T }, ctx: LeaseCtx): T {
+  if (!res.ok) throw new SupersededError(ctx.tape);
+  return res.value as T;
+}
+
+async function syncSource(db: DatabaseSync, ctx: LeaseCtx, opts: CollectorOpts, ttl: number, log: Log): Promise<void> {
+  const site = opts.siteUrl;
+  const tape = ctx.tape;
   let src = db.prepare('SELECT * FROM sources WHERE tape_id = ?').get(tape) as any;
 
-  // 暂停期间：停止向该来源发请求
-  if (src.paused_until && Date.now() < src.paused_until) return;
+  // 暂停期间：停止向该来源发请求。暂停登记跨进程有效（接管不清除 paused_until）。
+  if (src.paused_until && Date.now() < src.paused_until) {
+    return;
+  }
 
   if (!src.session_id) {
+    // 建会话前先确认租约仍归本进程，避免被接管后的旧进程无谓轮换站点签名令牌
+    if (!renewLease(db, ctx, ttl)) throw new SupersededError(tape);
     const r = await httpReq('POST', `${site}/api/sources/${tape}/session`);
-    if (await handleCommon(db, tape, r, log)) return;
+    if (await handleCommon(db, ctx, ttl, r, log)) return;
     if (r.status !== 200) {
       log(`${tape}: 建立会话失败（status=${r.status}）`);
       return;
     }
-    db.prepare('UPDATE sources SET session_id = ?, sign_token = ? WHERE tape_id = ?').run(r.body.sessionId, r.body.signToken, tape);
+    mustApply(
+      withFencedTx(db, ctx, ttl, () =>
+        db.prepare('UPDATE sources SET session_id = ?, sign_token = ? WHERE tape_id = ?')
+          .run(r.body.sessionId, r.body.signToken, tape),
+      ),
+      ctx,
+    );
     log(`${tape}: 建立会话 ${r.body.sessionId.slice(0, 8)}…（签名令牌 ${String(r.body.signToken).slice(0, 8)}…）`);
     src = db.prepare('SELECT * FROM sources WHERE tape_id = ?').get(tape) as any;
   }
 
   const idx = await httpReq('GET', `${site}/api/sources/${tape}/index?sessionId=${src.session_id}`);
-  if (await handleCommon(db, tape, idx, log)) return;
+  if (await handleCommon(db, ctx, ttl, idx, log)) return;
   if (idx.status !== 200) {
     log(`${tape}: 拉取索引失败（status=${idx.status}）`);
     return;
   }
-  if (idx.body?.signToken) db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(idx.body.signToken, tape);
-  reconcile(db, tape, idx.body, log);
+  if (idx.body?.signToken) {
+    mustApply(
+      withFencedTx(db, ctx, ttl, () =>
+        db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(idx.body.signToken, tape),
+      ),
+      ctx,
+    );
+  }
+  mustApply(withFencedTx(db, ctx, ttl, () => reconcile(db, tape, idx.body, log)), ctx);
 
   // 每个轮询周期内尽量多采（上限避免单个来源占满），逐页落库
   for (let i = 0; i < 8; i++) {
+    // 每页前续租；已被接管则立即停止，不再向站点发请求
+    if (!renewLease(db, ctx, ttl)) throw new SupersededError(tape);
     const rev = db
       .prepare(
         `SELECT * FROM revisions
@@ -94,21 +200,39 @@ async function syncSource(db: DatabaseSync, site: string, tape: string, log: Log
       )
       .get(tape) as any;
     if (!rev) return;
-    const progressed = await fetchPage(db, site, tape, rev, log);
+    const progressed = await fetchPage(db, ctx, site, rev, ttl, opts, log);
     if (!progressed) return;
   }
 }
 
 /** 处理 401/423 等来源级状态；返回 true 表示本轮应停止该来源 */
-async function handleCommon(db: DatabaseSync, tape: string, r: { status: number; body: any }, log: Log): Promise<boolean> {
+async function handleCommon(
+  db: DatabaseSync,
+  ctx: LeaseCtx,
+  ttl: number,
+  r: { status: number; body: any },
+  log: Log,
+): Promise<boolean> {
+  const tape = ctx.tape;
   if (r.status === 401) {
-    db.prepare('UPDATE sources SET session_id = NULL, sign_token = NULL WHERE tape_id = ?').run(tape);
+    mustApply(
+      withFencedTx(db, ctx, ttl, () =>
+        db.prepare('UPDATE sources SET session_id = NULL, sign_token = NULL WHERE tape_id = ?').run(tape),
+      ),
+      ctx,
+    );
     log(`${tape}: 会话失效，下轮重建`);
     return true;
   }
   if (r.status === 423) {
     const until = Number(r.body?.pausedUntil ?? Date.now() + 5000);
-    db.prepare('UPDATE sources SET paused_until = ?, session_id = NULL, sign_token = NULL WHERE tape_id = ?').run(until, tape);
+    mustApply(
+      withFencedTx(db, ctx, ttl, () =>
+        db.prepare('UPDATE sources SET paused_until = ?, session_id = NULL, sign_token = NULL WHERE tape_id = ?')
+          .run(until, tape),
+      ),
+      ctx,
+    );
     log(`${tape}: 站点要求暂停至 ${new Date(until).toISOString()}，期间停止向该来源发请求`);
     return true;
   }
@@ -117,54 +241,54 @@ async function handleCommon(db: DatabaseSync, tape: string, r: { status: number;
 
 /** 索引对账：新修订登记、撤下标记（未采齐→放弃；已采齐→保留可复用） */
 function reconcile(db: DatabaseSync, tape: string, index: any, log: Log): void {
-  withTx(db, () => {
-    for (const tl of index.timelines ?? []) {
+  for (const tl of index.timelines ?? []) {
+    db.prepare(
+      `INSERT INTO timelines (tape_id, timeline_version, duration_ms) VALUES (?,?,?)
+       ON CONFLICT(tape_id, timeline_version) DO UPDATE SET duration_ms = excluded.duration_ms`,
+    ).run(tape, tl.version, tl.durationMs);
+  }
+  const seen = new Set<string>();
+  for (const m of index.manifests ?? []) {
+    seen.add(`${m.kind}:${m.timelineVersion}:${m.revision}`);
+    const row = db
+      .prepare('SELECT * FROM revisions WHERE tape_id = ? AND kind = ? AND timeline_version = ? AND revision = ?')
+      .get(tape, m.kind, m.timelineVersion, m.revision) as any;
+    if (!row) {
       db.prepare(
-        `INSERT INTO timelines (tape_id, timeline_version, duration_ms) VALUES (?,?,?)
-         ON CONFLICT(tape_id, timeline_version) DO UPDATE SET duration_ms = excluded.duration_ms`,
-      ).run(tape, tl.version, tl.durationMs);
-    }
-    const seen = new Set<string>();
-    for (const m of index.manifests ?? []) {
-      seen.add(`${m.kind}:${m.timelineVersion}:${m.revision}`);
-      const row = db
-        .prepare('SELECT * FROM revisions WHERE tape_id = ? AND kind = ? AND timeline_version = ? AND revision = ?')
-        .get(tape, m.kind, m.timelineVersion, m.revision) as any;
-      if (!row) {
-        db.prepare(
-          `INSERT INTO revisions (tape_id, kind, timeline_version, revision, page_count, pages_done, status, listed, updated_at)
-           VALUES (?,?,?,?,?,0,'pending',1,?)`,
-        ).run(tape, m.kind, m.timelineVersion, m.revision, m.pageCount, Date.now());
-        log(`${tape}: 发现 ${kindName(m.kind)} v${m.timelineVersion} rev${m.revision}（${m.pageCount} 页），待采集`);
-      } else {
-        db.prepare('UPDATE revisions SET page_count = ?, listed = 1, updated_at = ? WHERE id = ?').run(m.pageCount, Date.now(), row.id);
-        if (row.status === 'abandoned') {
-          db.prepare("UPDATE revisions SET status = 'pending', pages_done = 0 WHERE id = ?").run(row.id);
-          for (const t of ['pages', 'programs', 'segments', 'damages']) {
-            db.prepare(`DELETE FROM ${t} WHERE revision_id = ?`).run(row.id);
-          }
-          log(`${tape}: ${kindName(m.kind)} v${m.timelineVersion} rev${m.revision} 重新上架，从头重采`);
+        `INSERT INTO revisions (tape_id, kind, timeline_version, revision, page_count, pages_done, status, listed, updated_at)
+         VALUES (?,?,?,?,?,0,'pending',1,?)`,
+      ).run(tape, m.kind, m.timelineVersion, m.revision, m.pageCount, Date.now());
+      log(`${tape}: 发现 ${kindName(m.kind)} v${m.timelineVersion} rev${m.revision}（${m.pageCount} 页），待采集`);
+    } else {
+      db.prepare('UPDATE revisions SET page_count = ?, listed = 1, updated_at = ? WHERE id = ?').run(m.pageCount, Date.now(), row.id);
+      if (row.status === 'abandoned') {
+        db.prepare("UPDATE revisions SET status = 'pending', pages_done = 0 WHERE id = ?").run(row.id);
+        for (const t of ['pages', 'programs', 'segments', 'damages']) {
+          db.prepare(`DELETE FROM ${t} WHERE revision_id = ?`).run(row.id);
         }
+        log(`${tape}: ${kindName(m.kind)} v${m.timelineVersion} rev${m.revision} 重新上架，从头重采`);
       }
     }
-    const locals = db.prepare('SELECT * FROM revisions WHERE tape_id = ? AND listed = 1').all(tape) as any[];
-    for (const row of locals) {
-      if (seen.has(`${row.kind}:${row.timeline_version}:${row.revision}`)) continue;
-      if (row.status === 'complete') {
-        db.prepare('UPDATE revisions SET listed = 0 WHERE id = ?').run(row.id);
-        log(`${tape}: ${kindName(row.kind)} v${row.timeline_version} rev${row.revision} 站点已撤下；本地已采齐，继续可用`);
-      } else {
-        db.prepare("UPDATE revisions SET listed = 0, status = 'abandoned' WHERE id = ?").run(row.id);
-        log(`${tape}: ${kindName(row.kind)} v${row.timeline_version} rev${row.revision} 站点已撤下，放弃未采齐部分（已采 ${row.pages_done}/${row.page_count} 页）`);
-      }
+  }
+  const locals = db.prepare('SELECT * FROM revisions WHERE tape_id = ? AND listed = 1').all(tape) as any[];
+  for (const row of locals) {
+    if (seen.has(`${row.kind}:${row.timeline_version}:${row.revision}`)) continue;
+    if (row.status === 'complete') {
+      db.prepare('UPDATE revisions SET listed = 0 WHERE id = ?').run(row.id);
+      log(`${tape}: ${kindName(row.kind)} v${row.timeline_version} rev${row.revision} 站点已撤下；本地已采齐，继续可用`);
+    } else {
+      db.prepare("UPDATE revisions SET listed = 0, status = 'abandoned' WHERE id = ?").run(row.id);
+      log(`${tape}: ${kindName(row.kind)} v${row.timeline_version} rev${row.revision} 站点已撤下，放弃未采齐部分（已采 ${row.pages_done}/${row.page_count} 页）`);
     }
-  });
+  }
 }
 
 /** 采一页；返回 true 表示有进展（可继续采下一页） */
-async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any, log: Log): Promise<boolean> {
+async function fetchPage(db: DatabaseSync, ctx: LeaseCtx, site: string, rev: any, ttl: number, opts: CollectorOpts, log: Log): Promise<boolean> {
+  const tape = ctx.tape;
   const label = `${tape} ${kindName(rev.kind)} v${rev.timeline_version} rev${rev.revision}`;
   for (let attempt = 0; attempt < 4; attempt++) {
+    if (!renewLease(db, ctx, ttl)) throw new SupersededError(tape);
     const src = db.prepare('SELECT * FROM sources WHERE tape_id = ?').get(tape) as any;
     const pageNo = rev.pages_done;
 
@@ -176,9 +300,9 @@ async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any,
       revision: rev.revision,
       page: pageNo,
     });
-    if (await handleCommon(db, tape, pt, log)) return false;
+    if (await handleCommon(db, ctx, ttl, pt, log)) return false;
     if (pt.status === 410) {
-      abandon(db, rev, log, label);
+      abandon(db, ctx, ttl, rev, log, label);
       return false;
     }
     if (pt.status !== 200) {
@@ -186,7 +310,14 @@ async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any,
       return false;
     }
     const pageToken = pt.body.pageToken as string;
-    if (pt.body.signToken) db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(pt.body.signToken, tape);
+    if (pt.body.signToken) {
+      mustApply(
+        withFencedTx(db, ctx, ttl, () =>
+          db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(pt.body.signToken, tape),
+        ),
+        ctx,
+      );
+    }
 
     // 2) 用「站点刚发出的签名令牌 + 当前会话」签名取页；过期则按 409 附的新令牌重签
     for (let sigTry = 0; sigTry < 3; sigTry++) {
@@ -202,7 +333,12 @@ async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any,
         break;
       }
       if (page.status === 409 && page.body?.error === 'STALE_SIGN_TOKEN') {
-        db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(page.body.signToken, tape);
+        mustApply(
+          withFencedTx(db, ctx, ttl, () =>
+            db.prepare('UPDATE sources SET sign_token = ? WHERE tape_id = ?').run(page.body.signToken, tape),
+          ),
+          ctx,
+        );
         log(`${label} 第${pageNo + 1}页：签名令牌已轮换，用新令牌重签`);
         continue;
       }
@@ -211,16 +347,24 @@ async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any,
         break;
       }
       if (page.status === 410) {
-        abandon(db, rev, log, label);
+        abandon(db, ctx, ttl, rev, log, label);
         return false;
       }
-      if (await handleCommon(db, tape, page, log)) return false;
+      if (await handleCommon(db, ctx, ttl, page, log)) return false;
       if (page.status !== 200) {
         log(`${label} 第${pageNo + 1}页：取页失败（status=${page.status}）`);
         return false;
       }
       const recs = normalize(page.body);
-      storePage(db, rev.id, pageNo, recs, log, label, page.body.layout);
+      opts.stallBeforeStore?.({
+        tape,
+        kind: rev.kind,
+        timelineVersion: rev.timeline_version,
+        revision: rev.revision,
+        pageNo,
+      });
+      // 迟到响应在这里被围栏拒绝：租约已易主时整页丢弃，进度与生效指针均不变
+      mustApply(withFencedTx(db, ctx, ttl, () => storePage(db, rev.id, pageNo, recs, log, label, page.body.layout)), ctx);
       return true;
     }
   }
@@ -228,42 +372,45 @@ async function fetchPage(db: DatabaseSync, site: string, tape: string, rev: any,
 }
 
 function storePage(db: DatabaseSync, revId: number, pageNo: number, recs: Rec[], log: Log, label: string, layout: string): void {
-  withTx(db, () => {
-    // 页级幂等：已入库的页（如重传）直接跳过，保证断点续采不产生重复记录
-    const ins = db.prepare('INSERT OR IGNORE INTO pages (revision_id, page_no, received_at) VALUES (?,?,?)').run(revId, pageNo, Date.now());
-    if (Number(ins.changes) === 0) return;
-    const rev = db.prepare('SELECT * FROM revisions WHERE id = ?').get(revId) as any;
-    for (const rec of recs) {
-      if (rec.type === 'program') {
-        db.prepare('INSERT OR REPLACE INTO programs (revision_id, program_id, title, start_ms, end_ms) VALUES (?,?,?,?,?)')
-          .run(revId, rec.programId, rec.title, rec.startMs, rec.endMs);
-      } else if (rec.type === 'segment') {
-        db.prepare('INSERT INTO segments (revision_id, copy_id, master_start_ms, master_end_ms, copy_start_ms, rate) VALUES (?,?,?,?,?,?)')
-          .run(revId, rec.copyId, rec.masterStartMs, rec.masterEndMs, rec.copyStartMs, rec.rate);
-      } else {
-        db.prepare('INSERT INTO damages (revision_id, copy_id, master_start_ms, master_end_ms, note) VALUES (?,?,?,?,?)')
-          .run(revId, rec.copyId, rec.masterStartMs, rec.masterEndMs, rec.note);
-      }
-    }
-    const done = rev.pages_done + 1;
-    const complete = done >= rev.page_count;
-    db.prepare('UPDATE revisions SET pages_done = ?, status = ?, updated_at = ? WHERE id = ?')
-      .run(done, complete ? 'complete' : 'collecting', Date.now(), revId);
-    if (complete) {
-      // 同一事务内切换生效指针：查询侧原子看到「播放位置 + 缺失区段」的整体更新
-      const a = recomputeActivation(db, rev.tape_id);
-      log(
-        `${label} 采齐（${done}/${rev.page_count} 页）` +
-          (a.changed ? `；生效版本切换 → 时间轴 v${a.timelineVersion}（节目单 rev${a.programRev} + 修复清单 rev${a.restorationRev}）` : ''),
-      );
+  // 页级幂等：已入库的页（如重传）直接跳过，保证断点续采不产生重复记录
+  const ins = db.prepare('INSERT OR IGNORE INTO pages (revision_id, page_no, received_at) VALUES (?,?,?)').run(revId, pageNo, Date.now());
+  if (Number(ins.changes) === 0) return;
+  const rev = db.prepare('SELECT * FROM revisions WHERE id = ?').get(revId) as any;
+  for (const rec of recs) {
+    if (rec.type === 'program') {
+      db.prepare('INSERT OR REPLACE INTO programs (revision_id, program_id, title, start_ms, end_ms) VALUES (?,?,?,?,?)')
+        .run(revId, rec.programId, rec.title, rec.startMs, rec.endMs);
+    } else if (rec.type === 'segment') {
+      db.prepare('INSERT INTO segments (revision_id, copy_id, master_start_ms, master_end_ms, copy_start_ms, rate) VALUES (?,?,?,?,?,?)')
+        .run(revId, rec.copyId, rec.masterStartMs, rec.masterEndMs, rec.copyStartMs, rec.rate);
     } else {
-      log(`${label} 第${pageNo + 1}/${rev.page_count} 页入库（${layout} 排版）`);
+      db.prepare('INSERT INTO damages (revision_id, copy_id, master_start_ms, master_end_ms, note) VALUES (?,?,?,?,?)')
+        .run(revId, rec.copyId, rec.masterStartMs, rec.masterEndMs, rec.note);
     }
-  });
+  }
+  const done = rev.pages_done + 1;
+  const complete = done >= rev.page_count;
+  db.prepare('UPDATE revisions SET pages_done = ?, status = ?, updated_at = ? WHERE id = ?')
+    .run(done, complete ? 'complete' : 'collecting', Date.now(), revId);
+  if (complete) {
+    // 同一事务内切换生效指针：查询侧原子看到「播放位置 + 缺失区段」的整体更新
+    const a = recomputeActivation(db, rev.tape_id);
+    log(
+      `${label} 采齐（${done}/${rev.page_count} 页）` +
+        (a.changed ? `；生效版本切换 → 时间轴 v${a.timelineVersion}（节目单 rev${a.programRev} + 修复清单 rev${a.restorationRev}）` : ''),
+    );
+  } else {
+    log(`${label} 第${pageNo + 1}/${rev.page_count} 页入库（${layout} 排版）`);
+  }
 }
 
-function abandon(db: DatabaseSync, rev: any, log: Log, label: string): void {
-  db.prepare("UPDATE revisions SET status = 'abandoned', listed = 0, updated_at = ? WHERE id = ?").run(Date.now(), rev.id);
+function abandon(db: DatabaseSync, ctx: LeaseCtx, ttl: number, rev: any, log: Log, label: string): void {
+  mustApply(
+    withFencedTx(db, ctx, ttl, () => {
+      db.prepare("UPDATE revisions SET status = 'abandoned', listed = 0, updated_at = ? WHERE id = ?").run(Date.now(), rev.id);
+    }),
+    ctx,
+  );
   log(`${label} 已被站点撤下（410），放弃未采齐部分（进度 ${rev.pages_done}/${rev.page_count} 页）`);
 }
 
